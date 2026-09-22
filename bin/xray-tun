@@ -194,10 +194,13 @@ case "${1:-status}" in
     logs)            shift; $SUDO journalctl -u "$UNIT" -n 100 "${@:--f}" ;;
     add)
         shift
-        # xray-tun add <name> <link>   |   xray-tun add <link>
+        # xray-tun add            -> prompts for the link (no shell, no & bug)
+        # xray-tun add <link>     -> name taken from the link's #remark
+        # xray-tun add <name> <link>
         case $# in
-          2) check_quoted "$2" || exit 2; $SUDO "$V2X" --install --name "$1" "$2" ;;
+          0) $SUDO "$V2X" --install ;;
           1) check_quoted "$1" || exit 2; $SUDO "$V2X" --install "$1" ;;
+          2) check_quoted "$2" || exit 2; $SUDO "$V2X" --install --name "$1" "$2" ;;
           *) echo "usage: xray-tun add [name] 'vless://...'" >&2; exit 2 ;;
         esac ;;
     import)
@@ -208,12 +211,11 @@ case "${1:-status}" in
     ls|list)         $SUDO "$V2X" --list ;;
     use|switch)
         shift
-        [ $# -ge 1 ] || { echo "usage: xray-tun use <name>" >&2; exit 2; }
-        $SUDO "$V2X" --use "$1" ;;
+        # No name: vless2xray opens an arrow-key picker.
+        if [ $# -ge 1 ]; then $SUDO "$V2X" --use "$1"; else $SUDO "$V2X" --use; fi ;;
     rm|remove|del)
         shift
-        [ $# -ge 1 ] || { echo "usage: xray-tun rm <name> [--force]" >&2; exit 2; }
-        $SUDO "$V2X" --remove "$@" ;;
+        if [ $# -ge 1 ]; then $SUDO "$V2X" --remove "$@"; else $SUDO "$V2X" --remove; fi ;;
     show)
         shift
         $SUDO "$V2X" --show "$@" ;;
@@ -238,11 +240,14 @@ xray-tun -- Xray full-tunnel VPN
   xray-tun disable       do not start at boot
 
 servers:
-  xray-tun add NAME URL  add a server from a vless:// link, and use it
+  xray-tun add           add a server -- prompts for the link
+  xray-tun add NAME URL  ...or pass it directly (quote the URL!)
   xray-tun ls            list servers  (* = active)
-  xray-tun use NAME      switch to another server
-  xray-tun rm NAME       delete a server  (--force if it is active)
+  xray-tun use [NAME]    switch; no name opens a picker
+  xray-tun rm [NAME]     delete; no name opens a picker
   xray-tun show [NAME]   details of a server; --show-link prints its URL
+
+  in a picker: arrows or w/s move, enter selects, q cancels, 1-9 jump
 
   xray-tun check         validate the config without starting
   xray-tun edit          edit /etc/xray-tun/config.json (server settings)

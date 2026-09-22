@@ -163,6 +163,71 @@ printf '{"outbounds":[]}' > "$CT/50-server.json"    # stale pre-zz drop-in
     && bad "sweeps stale 50-server.json" "still there" \
     || ok "sweeps stale 50-server.json"
 
+# --------------------------------------------------------------- menus
+# The pickers and prompts only exist when there is a real terminal, so these
+# run the tool under a pseudo-terminal and type at it.
+echo "interactive menus:"
+TUI=$WORK/tui; mkdir -p "$TUI"
+cp "$SRC/etc/config.json" "$SRC/etc/xray-tun.conf" "$TUI/"
+for n in aaa bbb ccc; do
+    XRAY_TUN_CONFDIR=$TUI "$V" --install --name "$n" \
+        "vless://1111-2222@$n.example.com:8443?type=ws&security=tls&sni=$n.example.com&path=%2Fws#$n node" \
+        >/dev/null 2>&1
+done
+drive() { python3 "$SRC/tests/drive_tty.py" "$TUI" "$1" -- "$V" "${@:2}"; }
+active_tui() { basename "$(readlink "$TUI/zz-server.json" 2>/dev/null)" .json 2>/dev/null; }
+
+# ccc is active and the cursor starts on it; one "up" lands on bbb.
+drive "up,\r" --use >/dev/null 2>&1
+is "arrow keys select"      "$(active_tui)" "bbb"
+drive "s,\r" --use >/dev/null 2>&1
+is "w/s also move"          "$(active_tui)" "ccc"
+drive "1" --use >/dev/null 2>&1
+is "digits jump"            "$(active_tui)" "aaa"
+drive "down,q" --use >/dev/null 2>&1
+is "q cancels"              "$(active_tui)" "aaa"
+drive "esc" --use >/dev/null 2>&1
+is "esc cancels"            "$(active_tui)" "aaa"
+case "$(drive "down,\r" --use 2>&1)" in
+    *"active profile is now"*) ok "picker reports the switch" ;;
+    *) bad "picker reports the switch" "no confirmation printed" ;;
+esac
+
+# Typed at our own prompt, a link with & arrives whole -- the shell, which is
+# what breaks an unquoted paste, is not in the path at all.
+out=$(drive 'vless://1111@tui.example.com:8443?type=ws&security=tls&sni=tui.example.com&path=%2Fws#Typed,\r,\r' --install 2>&1)
+case "$out" in
+    *"added profile 'Typed'"*) ok "interactive add keeps & intact" ;;
+    *) bad "interactive add keeps & intact" "$(printf '%s' "$out" | tail -1)" ;;
+esac
+case "$out" in
+    *"ws"*"tls"*) ok "add shows a summary before saving" ;;
+    *) bad "add shows a summary before saving" "no summary" ;;
+esac
+case "$(drive '\r' --install 2>&1)" in
+    *cancelled*) ok "blank link cancels the add" ;;
+    *) bad "blank link cancels the add" "did not cancel" ;;
+esac
+
+# Deleting from the menu confirms first, and offers a replacement after.
+before=$(XRAY_TUN_CONFDIR=$TUI "$V" --list 2>/dev/null | wc -l)
+case "$(drive "down,\r,n,\r" --remove 2>&1)" in
+    *delete*) ok "remove asks before deleting" ;;
+    *) bad "remove asks before deleting" "no confirmation prompt" ;;
+esac
+is "answering no keeps it" "$(XRAY_TUN_CONFDIR=$TUI "$V" --list 2>/dev/null | wc -l)" "$before"
+drive "down,\r,y,\r" --remove >/dev/null 2>&1
+is "answering yes deletes" "$(XRAY_TUN_CONFDIR=$TUI "$V" --list 2>/dev/null | wc -l)" "$((before - 1))"
+
+# With no terminal there is nothing to draw on: say so, never hang.
+if timeout 5 "$V" --use </dev/null >/dev/null 2>&1; then
+    bad "no-tty --use exits" "should have failed"
+else
+    rc=$?
+    [ "$rc" -eq 124 ] && bad "no-tty --use exits" "hung until timeout" \
+                      || ok "no-tty --use exits cleanly"
+fi
+
 echo
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

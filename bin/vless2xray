@@ -55,6 +55,8 @@ SERVICE = "xray-tun.service"
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
+TTY = None  # set in main(); the controlling terminal, if we have one
+
 
 def die(msg):
     sys.exit(f"vless2xray: {msg}")
@@ -473,13 +475,276 @@ def render(outbound, remark, link, name, tag):
                                                 indent=2) + "\n"
 
 
+# ------------------------------------------------------------------- terminal
+#
+# Everything here talks to /dev/tty directly rather than stdin/stdout, for two
+# reasons: these commands run under sudo, and stdout has to stay clean so
+# `--show-link` and friends can still be piped into something.
+
+
+class Tty:
+    """The controlling terminal, or nothing at all."""
+
+    def __init__(self):
+        try:
+            self.fh = open("/dev/tty", "r+b", buffering=0)
+        except OSError:
+            self.fh = None
+
+    def __bool__(self):
+        return self.fh is not None
+
+    def write(self, text):
+        if self.fh:
+            self.fh.write(text.encode())
+
+    def key(self):
+        """One keypress, with escape sequences folded into names."""
+        import select
+        ch = self.fh.read(1)
+        if not ch:
+            return "eof"
+        if ch != b"\x1b":
+            return ch.decode("utf-8", "replace")
+        # Escape: an arrow key sends more bytes immediately, a bare Esc does
+        # not. A short select settles which one this is.
+        if not select.select([self.fh], [], [], 0.05)[0]:
+            return "esc"
+        seq = self.fh.read(2)
+        return {b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left",
+                b"[H": "home", b"[F": "end"}.get(seq, "esc")
+
+    def line(self, prompt):
+        """A whole line, typed at our prompt -- the shell never sees it, so a
+        pasted link cannot be mangled at its first '&'.
+
+        The terminal is in canonical mode here, so it does the echoing and the
+        line editing for us; doing either ourselves would double every
+        keystroke.
+        """
+        self.write(prompt)
+        out = b""
+        while True:
+            ch = self.fh.read(1)
+            if not ch or ch in (b"\r", b"\n"):
+                return out.decode("utf-8", "replace").strip()
+            out += ch
+
+
+def interactive():
+    return TTY and sys.stdin.isatty()
+
+
+class raw_mode:
+    """Unbuffered, un-echoed keys for as long as we need them."""
+
+    def __enter__(self):
+        import termios, tty as ttymod
+        self.fd = TTY.fh.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        ttymod.setraw(self.fd)
+        TTY.write("\033[?25l")                      # hide cursor
+        return self
+
+    def __exit__(self, *exc):
+        import termios
+        TTY.write("\033[?25h")
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+
+def _palette(on):
+    codes = {"dim": "\033[2m", "b": "\033[1m", "r": "\033[0m",
+             "cyan": "\033[36m", "green": "\033[32m", "red": "\033[31m",
+             "yellow": "\033[33m"}
+    return codes if on else dict.fromkeys(codes, "")
+
+
+# Two palettes, because these go to two different places. C is for stdout,
+# which may well be a pipe -- `xray-tun ls | grep` should not get escape
+# codes. T is for the menus, which are drawn on /dev/tty by definition.
+C = _palette(sys.stdout.isatty() and not os.environ.get("NO_COLOR"))
+T = _palette(not os.environ.get("NO_COLOR"))
+
+
+def width():
+    try:
+        return max(40, shutil.get_terminal_size().columns)
+    except Exception:
+        return 80
+
+
+def pick(rows, title, hint="enter select \u00b7 q cancel", initial=0):
+    """Arrow-key menu. rows: (key, columns, marked). Returns a key or None.
+
+    Falls back to a numbered prompt when there is no terminal to draw on, so
+    the same call works over a pipe or in a script.
+    """
+    if not rows:
+        return None
+    if not interactive():
+        return None
+
+    labels = []
+    for key, cols, marked in rows:
+        labels.append((("\u25cf " if marked else "  ") + cols, key))
+
+    i = max(0, min(initial, len(rows) - 1))
+    drawn = 0
+
+    def draw():
+        nonlocal drawn
+        if drawn:
+            TTY.write(f"\033[{drawn}A")             # back to the top
+        out = [f"\r\033[K {T['b']}{title}{T['r']}  {T['dim']}{hint}{T['r']}\n",
+               "\r\033[K\n"]
+        w = width() - 4
+        for n, (label, _) in enumerate(labels):
+            text = label if len(label) <= w else label[:w - 1] + "\u2026"
+            if n == i:
+                out.append(f"\r\033[K {T['cyan']}\u25b8 {text}{T['r']}\n")
+            else:
+                out.append(f"\r\033[K   {text}\n")
+        TTY.write("".join(out))
+        drawn = len(out)
+
+    try:
+        with raw_mode():
+            while True:
+                draw()
+                k = TTY.key()
+                if k in ("up", "w", "k"):
+                    i = (i - 1) % len(rows)
+                elif k in ("down", "s", "j"):
+                    i = (i + 1) % len(rows)
+                elif k == "home":
+                    i = 0
+                elif k == "end":
+                    i = len(rows) - 1
+                elif k in ("\r", "\n", " "):
+                    return rows[i][0]
+                elif k in ("q", "esc", "\x03", "eof"):
+                    return None
+                elif k.isdigit() and k != "0" and int(k) <= len(rows):
+                    return rows[int(k) - 1][0]
+    except KeyboardInterrupt:
+        return None
+    finally:
+        TTY.write("\n")
+
+
+def confirm(question, default=False):
+    if not interactive():
+        return default
+    tail = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = TTY.line(f"{question} {T['dim']}{tail}{T['r']} ").lower()
+    except KeyboardInterrupt:
+        return False
+    return default if not answer else answer.startswith("y")
+
+
+def ask(question, default=""):
+    if not interactive():
+        return default
+    shown = f" {T['dim']}[{default}]{T['r']}" if default else ""
+    try:
+        return TTY.line(f"{question}{shown}: ").strip() or default
+    except KeyboardInterrupt:
+        return ""
+
+
+def profile_rows(active=None, pal=None):
+    """The shared menu body: one aligned row per saved server."""
+    pal = pal if pal is not None else C
+    names = list_profiles()
+    if not names:
+        return []
+    act = active if active is not None else active_name()
+    wn = max(len(n) for n in names)
+    metas = {n: read_meta(profile_path(n)) for n in names}
+    ws = max(len(m["server"]) for m in metas.values())
+    rows = []
+    for n in names:
+        m = metas[n]
+        sec = m["security"] if m["security"] not in ("", "none") else "-"
+        cols = (f"{n.ljust(wn)}  {pal['dim']}{m['server'].ljust(ws)}"
+                f"  {m['transport']}/{sec}{pal['r']}")
+        if m["remark"] and m["remark"] != n:
+            cols += f"  {pal['dim']}{m['remark']}{pal['r']}"
+        rows.append((n, cols, n == act))
+    return rows
+
+
+def choose_profile(title, initial_active=True):
+    """Pick a profile by menu, or explain why we cannot."""
+    rows = profile_rows(pal=T)
+    if not rows:
+        die("no servers saved yet -- add one with: xray-tun add")
+    if not interactive():
+        die("no server named, and no terminal to ask on "
+            "(pass a name: xray-tun use NAME)")
+    start = 0
+    if initial_active:
+        act = active_name()
+        start = next((n for n, r in enumerate(rows) if r[0] == act), 0)
+    return pick(rows, title, initial=start)
+
+
 # ---------------------------------------------------------------- actions
+
+
+def describe(outbound):
+    """A short human summary of what we are about to save."""
+    v = outbound["settings"]["vnext"][0]
+    st = outbound["streamSettings"]
+    sec = st.get("security", "none")
+    lines = [("server", f"{v['address']}:{v['port']}"),
+             ("transport", st.get("network", "?"))]
+    net = st.get("network")
+    detail = {"ws": "wsSettings", "httpupgrade": "httpupgradeSettings",
+              "xhttp": "xhttpSettings", "h2": "httpSettings"}.get(net)
+    if detail and st.get(detail, {}).get("path"):
+        lines[-1] = ("transport", f"{net}   path {st[detail]['path']}")
+    elif net == "grpc" and st.get("grpcSettings", {}).get("serviceName"):
+        lines[-1] = ("transport", f"grpc   service {st['grpcSettings']['serviceName']}")
+    if sec == "reality":
+        lines.append(("security", f"reality   sni {st['realitySettings']['serverName']}"))
+    elif sec == "tls":
+        t = st.get("tlsSettings", {})
+        extra = f"   sni {t.get('serverName', '?')}"
+        if t.get("alpn"):
+            extra += f", alpn {','.join(t['alpn'])}"
+        if t.get("allowInsecure"):
+            extra += "   (certificate checking OFF)"
+        lines.append(("security", "tls" + extra))
+    else:
+        lines.append(("security", f"{T['yellow']}none -- plaintext{T['r']}"))
+    flow = v["users"][0].get("flow")
+    if flow:
+        lines.append(("flow", flow))
+    return lines
 
 
 def cmd_add(link, name, tag, mark, restart, force=False):
     need_root("--install")
     require_confdir()
     repair_store()
+
+    if not link:
+        if not interactive():
+            die("no link given (pass a vless:// URL, or - for stdin)")
+        TTY.write(f"\n {T['b']}add a server{T['r']}  "
+                  f"{T['dim']}paste the vless:// link, or blank to cancel{T['r']}\n\n")
+        try:
+            link = TTY.line(" link: ").strip()
+        except KeyboardInterrupt:
+            link = ""
+        if not link:
+            print("cancelled")
+            return
+        # Typed at our own prompt, so the shell never saw it -- no & mangling
+        # is possible here, which is the whole reason this flow exists.
+        force = True
 
     bad = looks_truncated(link)
     if bad and not force:
@@ -488,8 +753,25 @@ def cmd_add(link, name, tag, mark, restart, force=False):
             "  If it really is that short, add --force.")
 
     outbound, remark = build_outbound(link, tag, mark)
-    if not name:
-        name = slugify(remark, "server")
+    suggested = slugify(remark, "server")
+
+    if not name and interactive():
+        TTY.write("\n")
+        for k, v in describe(outbound):
+            TTY.write(f"   {T['dim']}{k.ljust(10)}{T['r']}{v}\n")
+        TTY.write("\n")
+        name = ask(" name it", suggested)
+        if not name:
+            print("cancelled")
+            return
+        if not NAME_RE.match(name):
+            die(f"bad profile name {name!r}: letters, digits, dot, dash, "
+                "underscore; must start alphanumeric")
+        if os.path.exists(profile_path(name)):
+            if not confirm(f" {name!r} already exists -- replace it?", default=True):
+                print("cancelled")
+                return
+    name = name or suggested
     check_name(name)
 
     text = render(outbound, remark, link.strip(), name, tag)
@@ -521,32 +803,30 @@ def cmd_add(link, name, tag, mark, restart, force=False):
 def cmd_list():
     require_confdir()
     repair_store()
-    names = list_profiles()
-    act = active_name()
-    if not names:
-        print("no profiles yet -- add one with: xray-tun add <name> 'vless://...'")
-        if act:
-            warn(f"active profile {act!r} has no file in {SERVERS_DIR}")
+    rows = profile_rows()
+    if not rows:
+        print("no servers yet -- add one with: xray-tun add")
         return
-    width = max(len(n) for n in names)
-    for n in names:
-        m = read_meta(profile_path(n))
-        star = "*" if n == act else " "
-        sec = m["security"] if m["security"] not in ("", "none") else "-"
-        line = f"{star} {n.ljust(width)}  {m['server']}  [{m['transport']}/{sec}]"
-        if m["remark"] and m["remark"] != n:
-            line += f"  {m['remark']}"
-        print(line)
-    if act and act not in names:
+    act = active_name()
+    # A filled dot reads better in a terminal; plain ASCII survives a pipe.
+    dot = "\u25cf" if C["r"] else "*"
+    for key, cols, marked in rows:
+        print((f" {C['green']}{dot}{C['r']} " if marked else "   ") + cols)
+    if act and act not in [r[0] for r in rows]:
         warn(f"active profile {act!r} has no file in {SERVERS_DIR}")
     elif not act:
-        warn("no active profile; config.json's placeholder is in use")
+        warn("no active server; config.json's placeholder is in use")
 
 
 def cmd_use(name, restart):
     need_root("--use")
     require_confdir()
     repair_store()
+    if not name:
+        name = choose_profile("switch to which server?")
+        if not name:
+            print("cancelled")
+            return
     check_name(name)
     if not os.path.exists(profile_path(name)):
         avail = ", ".join(list_profiles()) or "none"
@@ -569,6 +849,13 @@ def cmd_remove(name, force, restart):
     need_root("--remove")
     require_confdir()
     repair_store()
+    chosen_here = False
+    if not name:
+        name = choose_profile("remove which server?", initial_active=False)
+        if not name:
+            print("cancelled")
+            return
+        chosen_here = True
     check_name(name)
     path = profile_path(name)
     if not os.path.exists(path):
@@ -576,7 +863,21 @@ def cmd_remove(name, force, restart):
         die(f"no profile {name!r} (have: {avail})")
 
     others = [n for n in list_profiles() if n != name]
-    if active_name() == name and not force:
+    is_active = active_name() == name
+
+    if chosen_here:
+        # Picked from a menu, so a typo is not the risk -- but deleting the
+        # server you are currently using still deserves a beat.
+        m = read_meta(path)
+        question = f"delete {T['b']}{name}{T['r']} ({m['server']})?"
+        if is_active:
+            question = (f"{T['yellow']}{name}{T['r']} is the active server. "
+                        "Delete it anyway?")
+        if not confirm(question, default=not is_active):
+            print("cancelled")
+            return
+        force = True
+    elif is_active and not force:
         hint = (f"switch first: xray-tun use {others[0]}"
                 if others else "it is the only profile")
         die(f"{name!r} is the active profile; {hint}. Use --force to remove anyway.")
@@ -584,15 +885,23 @@ def cmd_remove(name, force, restart):
     os.remove(path)
     print(f"removed profile {name!r}")
 
-    if active_name() == name:
-        # Forced removal of the active one: don't leave a dangling symlink,
-        # xray would fail to start on it.
+    if is_active:
+        # Removing the active one: don't leave a dangling symlink behind,
+        # xray refuses to start on one.
         if os.path.lexists(DROPIN_PATH):
             os.remove(DROPIN_PATH)
-        if others:
-            print(f"no active profile now; pick one: xray-tun use {others[0]}")
+        if not others:
+            print("no servers left; config.json's placeholder is in use again")
+        elif chosen_here and interactive():
+            nxt = choose_profile("switch to which server now?",
+                                 initial_active=False)
+            if nxt:
+                link_profile(nxt)
+                print(f"active profile is now {nxt!r}")
+            else:
+                print(f"no active server; pick one later: xray-tun use {others[0]}")
         else:
-            print("no profiles left; config.json's placeholder is in use again")
+            print(f"no active profile now; pick one: xray-tun use {others[0]}")
         if restart:
             restart_if_running(quiet=True)
 
@@ -627,6 +936,12 @@ def cmd_show(name, want_link):
         print("link      (stored; print it with --show-link)")
 
 
+def mark_for(args):
+    if args.no_mark:
+        return None
+    return args.mark if args.mark is not None else default_mark()
+
+
 def main():
     ap = argparse.ArgumentParser(
         prog="vless2xray",
@@ -641,8 +956,10 @@ def main():
     store.add_argument("--name", metavar="NAME",
                        help="profile name (default: slug of the link's #remark)")
     store.add_argument("--list", action="store_true", help="list profiles")
-    store.add_argument("--use", metavar="NAME", help="switch to a profile")
-    store.add_argument("--remove", metavar="NAME", help="delete a profile")
+    store.add_argument("--use", metavar="NAME", nargs="?", const="",
+                       help="switch to a profile (no name: pick from a menu)")
+    store.add_argument("--remove", metavar="NAME", nargs="?", const="",
+                       help="delete a profile (no name: pick from a menu)")
     store.add_argument("--force", action="store_true",
                        help="with --remove, allow removing the active profile; "
                             "with --install, accept a link that looks truncated")
@@ -669,8 +986,9 @@ def main():
     restart = not args.no_restart
 
     # --- store actions, one at a time ---
-    picked = [n for n, v in (("--list", args.list), ("--use", args.use),
-                             ("--remove", args.remove),
+    picked = [n for n, v in (("--list", args.list),
+                             ("--use", args.use is not None),
+                             ("--remove", args.remove is not None),
                              ("--show", args.show is not None)) if v]
     if len(picked) > 1:
         die(f"pick one of {', '.join(picked)}, not several")
@@ -679,15 +997,19 @@ def main():
 
     if args.list:
         return cmd_list()
-    if args.use:
+    if args.use is not None:
         return cmd_use(args.use, restart)
-    if args.remove:
+    if args.remove is not None:
         return cmd_remove(args.remove, args.force, restart)
     if args.show is not None:
         return cmd_show(args.show or None, args.show_link)
 
     # --- conversion (and optionally adding a profile) ---
     if args.link is None:
+        if args.install:
+            # Interactive add: cmd_add prompts for the link itself.
+            return cmd_add("", args.name, args.tag, mark_for(args), restart,
+                           args.force)
         if sys.stdin.isatty():
             ap.error("no link given (pass a vless:// URL, - for stdin, "
                      "or a profile action such as --list)")
@@ -700,8 +1022,7 @@ def main():
         die(f"got {len(links)} links; pass one at a time")
     link = links[0]
 
-    mark = None if args.no_mark else (args.mark if args.mark is not None
-                                      else default_mark())
+    mark = mark_for(args)
 
     if args.install:
         return cmd_add(link, args.name, args.tag, mark, restart, args.force)
@@ -725,4 +1046,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    TTY = Tty()
+    try:
+        main()
+    except KeyboardInterrupt:
+        if TTY:
+            TTY.write("\033[?25h\n")
+        sys.exit(130)

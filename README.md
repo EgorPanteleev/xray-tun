@@ -57,21 +57,33 @@ Every command that reports an exit IP probes the network on a short leash
 Servers, one profile each:
 
 ```
-xray-tun add NAME URL   # add (or update) a server, and switch to it
-xray-tun ls             # list them, * marks the active one
-xray-tun use NAME       # switch
-xray-tun rm NAME        # delete (--force if it is the active one)
+xray-tun add            # prompts for the link, then a name
+xray-tun add NAME URL   # ...or pass it directly (quote the URL)
+xray-tun ls             # list them
+xray-tun use [NAME]     # switch; no name opens a picker
+xray-tun rm [NAME]      # delete; no name opens a picker
 xray-tun show [NAME]    # details; --show-link prints the original URL
 ```
 
+`use` and `rm` with no name open an arrow-key menu:
+
 ```console
-$ xray-tun ls
-* tokyo   tokyo.example.com:443   [ws/tls]        Tokyo Node
-  berlin  berlin.example.com:443  [tcp/reality]   Berlin
-$ xray-tun use berlin
-active profile is now 'berlin'
-restarted xray-tun.service
+$ xray-tun use
+
+ switch to which server?  enter select · q cancel
+
+   berlin  berlin.example.com:443   tcp/reality  Berlin
+ ▸ ● tokyo  tokyo.example.com:443   ws/tls       Tokyo Node
+   osaka   osaka.example.com:8443   grpc/tls     Osaka
 ```
+
+Arrows or `w`/`s` (or `j`/`k`) move, `enter` selects, `1`-`9` jump straight to
+a row, `q` or `esc` cancels. The cursor starts on the server you are using,
+marked `●`. Deleting asks first, and warns if you picked the active one; if
+that leaves you with no server, it offers the picker again to choose the next.
+
+Switching restarts the daemon only if it is already running, so `use` is safe
+while the tunnel is down.
 
 Switching restarts the daemon only if it is already running, so `use` is safe
 while the tunnel is down.
@@ -92,6 +104,29 @@ vless2xray 'vless://...'                  # print the drop-in, change nothing
 vless2xray --outbound 'vless://...'       # print just the outbound object
 pbpaste | vless2xray -                    # read the link from stdin
 ```
+
+### Adding a server, interactively
+
+`xray-tun add` with no arguments prompts for the link, shows what it parsed,
+and suggests a name from the link's `#remark`:
+
+```console
+$ xray-tun add
+
+ add a server  paste the vless:// link, or blank to cancel
+
+ link: vless://uuid@203.0.113.10:8443?path=%2Fws&security=tls&type=ws#Amsterdam
+
+   server    203.0.113.10:8443
+   transport ws   path /ws
+   security  tls   sni 203.0.113.10, alpn h2,http/1.1
+
+ name it [Amsterdam]:
+```
+
+**This is the safest way to add a server**, because the link never passes
+through a shell — see below for why that matters. A blank line cancels, and an
+existing name asks before it is replaced.
 
 ### Quote the link
 
@@ -114,7 +149,10 @@ TLS and no WebSocket. It installs, it looks healthy in `ls`, and it simply
 cannot connect. (The `Stopped` job is the same bug: a backgrounded command
 that reaches a `sudo` password prompt is suspended by `SIGTTIN`.)
 
-`add` now refuses a link with that signature — a single query parameter and no
+Running `xray-tun add` with no arguments and pasting at its prompt sidesteps
+this entirely — nothing between your clipboard and the parser can cut the link.
+
+`add` also refuses a link with that signature — a single query parameter and no
 `#name` — and says so before it asks for a password. If a link really is that
 short, `vless2xray --install --force` accepts it.
 
@@ -189,6 +227,10 @@ No root, no network, no touching `/etc` — everything runs against a throwaway
 config dir via `XRAY_TUN_CONFDIR`, and every generated config is checked by
 xray's own parser rather than by what we think it should say. Needs `xray` on
 `PATH`.
+
+The menus are covered too: `tests/drive_tty.py` runs the tool under a
+pseudo-terminal and types at it, so the pickers and prompts are exercised the
+way a person would drive them rather than being assumed to still work.
 
 `XRAY_TUN_CONFDIR` also works outside the tests, if you want `vless2xray` to
 manage a config tree other than the system one.
