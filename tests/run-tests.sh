@@ -94,7 +94,7 @@ import sys, json
 d = json.load(sys.stdin)
 print([o for o in d['outbounds'] if o['tag']=='proxy'][0]['settings']['vnext'][0]['address'])"; }
 
-"$V" --install --name alpha 'vless://1111@alpha.example.com:443?type=tcp&security=none' >/dev/null
+"$V" --install --name alpha 'vless://1111@alpha.example.com:2443?type=tcp&security=none' >/dev/null
 "$V" --install --name beta  'vless://2222@beta.example.com:443?type=ws&security=tls&sni=beta.example.com' >/dev/null
 is "add activates the newest"  "$(active)" "beta"
 is "xray uses the active one"  "$(server)" "beta.example.com"
@@ -104,7 +104,7 @@ is "only active one is merged" "$(xray run -dump -confdir "$CT" 2>/dev/null | gr
 is "use switches"              "$(active)" "alpha"
 is "xray follows the switch"   "$(server)" "alpha.example.com"
 
-"$V" --install --name alpha 'vless://9999@alpha2.example.com:443?type=tcp&security=none' >/dev/null
+"$V" --install --name alpha 'vless://9999@alpha2.example.com:2443?type=tcp&security=none' >/dev/null
 is "re-add updates in place"   "$(server)" "alpha2.example.com"
 is "re-add keeps it active"    "$(active)" "alpha"
 
@@ -120,12 +120,37 @@ xray run -dump -confdir "$CT" >/dev/null 2>&1 \
 
 echo "bad names:"
 for n in '../evil' '/etc/passwd' 'a/b' '.hidden'; do
-    if "$V" --install --name "$n" 'vless://4444@x.example.com:443?type=tcp' >/dev/null 2>&1
+    if "$V" --install --name "$n" 'vless://4444@x.example.com:2443?type=tcp' >/dev/null 2>&1
     then bad "rejects $n" "accepted"; else ok "rejects $n"; fi
 done
 
+echo "shell-truncated links:"
+# Unquoted at a prompt, bash cuts a vless:// link at the first & -- and what
+# survives still parses, as a plain-TCP server that cannot connect. These
+# assert we refuse it instead of storing something that looks healthy.
+refuses() {
+    if "$V" --install --name trunc "$2" >/dev/null 2>&1
+    then bad "$1" "accepted a truncated link"; else ok "$1"; fi
+}
+accepts() {
+    if "$V" --install --name fine "$2" >/dev/null 2>&1
+    then ok "$1"; else bad "$1" "refused a good link"; fi
+}
+refuses "refuses a cut link"        'vless://u@h.example.com:8443?path=%2Fws'
+accepts "accepts a full link"       'vless://u@h.example.com:8443?path=%2Fws&security=tls&type=ws#Real'
+accepts "accepts one param + #name" 'vless://u@h.example.com:2443?encryption=none#Named'
+accepts "accepts a bare link"       'vless://u@h.example.com:2443'
+if "$V" --install --name forced --force 'vless://u@h.example.com:8443?path=%2Fws' >/dev/null 2>&1
+then ok "--force overrides the guard"; else bad "--force overrides the guard" "still refused"; fi
+
+# and the wrapper catches it before sudo, which matters: an unquoted command is
+# backgrounded, and a background job that hits a password prompt is stopped by
+# SIGTTIN before it can print anything.
+if bin/xray-tun add trunc 'vless://u@h.example.com:8443?path=%2Fws' >/dev/null 2>&1
+then bad "wrapper catches it pre-sudo" "accepted"; else ok "wrapper catches it pre-sudo"; fi
+
 echo "self-repair:"
-"$V" --install --name gamma 'vless://5555@gamma.example.com:443?type=tcp&security=none' >/dev/null
+"$V" --install --name gamma 'vless://5555@gamma.example.com:2443?type=tcp&security=none' >/dev/null
 rm -f "$CT/servers/gamma.json"                     # dangling symlink
 "$V" --list >/dev/null 2>&1
 xray run -dump -confdir "$CT" >/dev/null 2>&1 \

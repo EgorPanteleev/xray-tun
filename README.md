@@ -50,6 +50,10 @@ xray-tun enable | disable  # autostart at boot (off by default)
 xray-tun check | edit | edit-net | logs | ip
 ```
 
+Every command that reports an exit IP probes the network on a short leash
+(4s, once — a broken tunnel swallows DNS too, so a longer wait buys nothing).
+`XRAY_TUN_NO_IP=1` skips the probe; `XRAY_TUN_IP_TIMEOUT` changes the budget.
+
 Servers, one profile each:
 
 ```
@@ -88,6 +92,34 @@ vless2xray 'vless://...'                  # print the drop-in, change nothing
 vless2xray --outbound 'vless://...'       # print just the outbound object
 pbpaste | vless2xray -                    # read the link from stdin
 ```
+
+### Quote the link
+
+**Always put the link in single quotes.** A `vless://` URL is full of `&` and
+`#`. Unquoted at a shell prompt, bash reads every `&` as "run the preceding
+command in the background", so the tool receives only the text up to the first
+one and the rest runs as stray jobs:
+
+```console
+$ xray-tun add tokyo vless://uuid@host:8443?path=/ws&security=tls&type=ws#Tokyo
+[1] 114921
+[2] 114922
+[2]   Done       security=tls
+[1]+  Stopped    xray-tun add tokyo vless://uuid@host:8443?path=/ws
+```
+
+The cruel part is that what survives is still a *valid* link —
+`vless://uuid@host:8443?path=/ws` parses cleanly as a plain-TCP server with no
+TLS and no WebSocket. It installs, it looks healthy in `ls`, and it simply
+cannot connect. (The `Stopped` job is the same bug: a backgrounded command
+that reaches a `sudo` password prompt is suspended by `SIGTTIN`.)
+
+`add` now refuses a link with that signature — a single query parameter and no
+`#name` — and says so before it asks for a password. If a link really is that
+short, `vless2xray --install --force` accepts it.
+
+A TLS-shaped port (443, 8443) with no `security=` also earns a warning, since
+that is the other shape a mangled link takes.
 
 ### Where things live
 
@@ -268,7 +300,12 @@ routing.
 
 `xray-tun status` says running, but `exit ip` is `unreachable`.
 
-**1. Is it the server, or the routing?** Test the outbound without the TUN:
+**0. Is the link intact?** `xray-tun show` — if `transport` says `tcp` and
+`security` says `none` on a server you know uses WebSocket or TLS, the link was
+truncated by the shell. Re-add it in single quotes; `add` updates in place.
+
+**1. Is it the server, or the routing?** `xray-tun on` now answers this for you
+when the exit IP comes back unreachable. By hand:
 
 ```sh
 curl --socks5-hostname 127.0.0.1:10808 https://api.ipify.org

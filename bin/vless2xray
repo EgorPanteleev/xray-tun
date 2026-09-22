@@ -71,6 +71,37 @@ def slugify(text, fallback="server"):
     return slug if slug and NAME_RE.match(slug) else fallback
 
 
+def looks_truncated(link):
+    """Detect a link the shell ate because it was not quoted.
+
+    A vless:// link is full of `&` and `#`. Unquoted at a shell prompt, bash
+    treats every `&` as "run the preceding command in the background", so the
+    tool receives only the text up to the FIRST `&` -- and everything after it
+    runs as a separate job. The cruel part is that the truncated remainder is
+    still a valid link: `vless://uuid@host:443?path=/ws` parses cleanly as a
+    plain-TCP server with no TLS and no WebSocket. It installs, it looks
+    healthy in `ls`, and it simply cannot connect.
+
+    Signature: a query string with a single parameter and no `#fragment` --
+    because the fragment sits at the very end, so anything that survived a cut
+    at the first `&` cannot still have one.
+    """
+    if "#" in link:
+        return None                       # fragment intact: nothing was cut
+    query = link.split("?", 1)[1] if "?" in link else ""
+    if not query or "&" in query or "=" not in query:
+        return None                       # no query, or the & survived
+    return (f"only one parameter ({query.split('=')[0]}=) and no #name -- the "
+            "shell probably cut it at the first '&'")
+
+
+def warn_weak_security(q, port):
+    """A TLS port with no security= is the other shape a mangled link takes."""
+    if (q.get("security") or "none").lower() == "none" and port in (443, 8443):
+        warn(f"no security= in a link to port {port}: this will connect in "
+             "plaintext, if it connects at all. Is the link complete?")
+
+
 def check_name(name):
     if not NAME_RE.match(name):
         die(f"bad profile name {name!r}: use letters, digits, dot, dash, "
@@ -376,6 +407,7 @@ def build_outbound(link, tag, mark):
     if q.get("level"):
         user["level"] = int(q["level"])
 
+    warn_weak_security(q, port)
     stream = build_stream(q, host)
     if mark is not None:
         stream["sockopt"] = {"mark": mark}
@@ -444,10 +476,16 @@ def render(outbound, remark, link, name, tag):
 # ---------------------------------------------------------------- actions
 
 
-def cmd_add(link, name, tag, mark, restart):
+def cmd_add(link, name, tag, mark, restart, force=False):
     need_root("--install")
     require_confdir()
     repair_store()
+
+    bad = looks_truncated(link)
+    if bad and not force:
+        die(f"that link looks truncated: {bad}.\n"
+            "  Put it in single quotes:  xray-tun add NAME 'vless://...'\n"
+            "  If it really is that short, add --force.")
 
     outbound, remark = build_outbound(link, tag, mark)
     if not name:
@@ -606,7 +644,8 @@ def main():
     store.add_argument("--use", metavar="NAME", help="switch to a profile")
     store.add_argument("--remove", metavar="NAME", help="delete a profile")
     store.add_argument("--force", action="store_true",
-                       help="with --remove, allow removing the active profile")
+                       help="with --remove, allow removing the active profile; "
+                            "with --install, accept a link that looks truncated")
     store.add_argument("--show", metavar="NAME", nargs="?", const="",
                        help="show a profile's details (default: the active one)")
     store.add_argument("--show-link", action="store_true",
@@ -665,8 +704,11 @@ def main():
                                       else default_mark())
 
     if args.install:
-        return cmd_add(link, args.name, args.tag, mark, restart)
+        return cmd_add(link, args.name, args.tag, mark, restart, args.force)
 
+    bad = looks_truncated(link)
+    if bad:
+        warn(f"this link looks truncated: {bad}. Quote it: '<vless://...>'")
     outbound, remark = build_outbound(link, args.tag, mark)
     if args.outbound:
         text = json.dumps(outbound, indent=2) + "\n"

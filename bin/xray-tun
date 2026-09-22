@@ -19,27 +19,84 @@ c_ok=$'\033[32m'; c_no=$'\033[31m'; c_dim=$'\033[2m'; c_b=$'\033[1m'; c_r=$'\033
 
 is_on() { systemctl is-active --quiet "$UNIT"; }
 
+# Look up the exit IP, on a short leash.
+#
+# This is the one thing here that talks to the network, and when the tunnel is
+# broken it is talking INTO a black hole: DNS has been pointed down the tunnel
+# too, so every lookup burns the full timeout. Keep the budget small and do not
+# pay it twice -- a second endpoint is only worth trying if the first failed
+# fast (wrong answer) rather than timing out (nothing is getting through).
+# Set XRAY_TUN_NO_IP=1 to skip the probe entirely.
+IP_TIMEOUT=${XRAY_TUN_IP_TIMEOUT:-4}
+
 exit_ip() {
-    local ip
-    ip=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null) \
-        || ip=$(curl -s --max-time 8 https://ifconfig.me 2>/dev/null)
-    [ -n "${ip:-}" ] && echo "$ip" || echo "unreachable"
+    [ "${XRAY_TUN_NO_IP:-0}" = 1 ] && { echo "(skipped)"; return; }
+    local ip rc
+    ip=$(curl -4 -s --connect-timeout "$IP_TIMEOUT" --max-time "$IP_TIMEOUT" \
+         https://api.ipify.org 2>/dev/null); rc=$?
+    if [ $rc -ne 0 ] && [ $rc -ne 28 ]; then
+        ip=$(curl -4 -s --connect-timeout "$IP_TIMEOUT" --max-time "$IP_TIMEOUT" \
+             https://ifconfig.me 2>/dev/null); rc=$?
+    fi
+    if [ -n "${ip:-}" ]; then
+        echo "$ip"
+    elif [ $rc -eq 28 ]; then
+        echo "unreachable (timed out after ${IP_TIMEOUT}s)"
+    else
+        echo "unreachable"
+    fi
+}
+
+# Is the active server reachable *without* the TUN? Answers "is it the server
+# or is it the routing" in one line, using the daemon's own SOCKS inbound.
+probe_socks() {
+    curl -4 -s -o /dev/null --connect-timeout "$IP_TIMEOUT" \
+         --max-time "$IP_TIMEOUT" \
+         --socks5-hostname 127.0.0.1:10808 https://api.ipify.org 2>/dev/null
 }
 
 cmd_on() {
     $SUDO systemctl start "$UNIT" || return 1
     sleep 1
-    if is_on; then
-        echo "${c_ok}tunnel up${c_r}  ${c_dim}(exit IP: $(exit_ip))${c_r}"
-    else
+    if ! is_on; then
         echo "${c_no}failed to start${c_r} -- run: xray-tun logs" >&2
         return 1
     fi
+    # Say it started before going near the network, so the prompt never looks
+    # frozen while we wait on a probe that may be doomed. Only redraw in place
+    # when stdout is a terminal -- in a pipe or a log, escape codes are noise.
+    local prof ip
+    prof=$(active_profile)
+    [ -t 1 ] && printf '%stunnel up%s  %s(%s, checking...)%s' \
+        "$c_ok" "$c_r" "$c_dim" "$prof" "$c_r"
+    ip=$(exit_ip)
+    [ -t 1 ] && printf '\r\033[K'
+    printf '%stunnel up%s  %s(%s, exit IP: %s)%s\n' \
+        "$c_ok" "$c_r" "$c_dim" "$prof" "$ip" "$c_r"
+    case "$ip" in unreachable*)
+        echo "${c_dim}traffic is not getting through. Next step:${c_r}" >&2
+        if probe_socks; then
+            echo "  the server answers on 127.0.0.1:10808, so the problem is" >&2
+            echo "  routing -- check: ip route get 1.1.1.1 mark ${FWMARK:-255}" >&2
+        else
+            echo "  the server does not answer on 127.0.0.1:10808 either, so" >&2
+            echo "  it is the server or the link, not the routing." >&2
+            echo "  check: xray-tun show   and   xray-tun logs" >&2
+        fi ;;
+    esac
 }
 
 cmd_off() {
     $SUDO systemctl stop "$UNIT" || return 1
     echo "${c_ok}tunnel down${c_r}  ${c_dim}(exit IP: $(exit_ip))${c_r}"
+}
+
+active_profile() {
+    if [ -L "$CONF_DIR/zz-server.json" ]; then
+        basename "$(readlink "$CONF_DIR/zz-server.json")" .json
+    else
+        echo "no server"
+    fi
 }
 
 cmd_status() {
@@ -69,7 +126,7 @@ cmd_status() {
 
     local act
     if [ -L "$CONF_DIR/zz-server.json" ]; then
-        act=$(basename "$(readlink "$CONF_DIR/zz-server.json")" .json)
+        act=$(active_profile)
         echo "${c_b}server${c_r}     $act"
     elif [ -e "$CONF_DIR/zz-server.json" ]; then
         echo "${c_b}server${c_r}     (unnamed; run 'xray-tun ls' to adopt it)"
@@ -104,6 +161,28 @@ conflicts() {
     return 0
 }
 
+# A vless:// link is full of & and #. Unquoted at a shell prompt, bash runs
+# everything after the first & as a separate background job and hands us only
+# the head of the link -- which still parses, as a plain-TCP server with no
+# TLS, and then silently cannot connect. Catch it here, BEFORE sudo: a
+# backgrounded job that reaches a password prompt is stopped by SIGTTIN, and
+# the user never sees a word of what went wrong.
+check_quoted() {
+    case "$1" in
+        *'#'*)     return 0 ;;   # fragment survived -> nothing was cut
+        *'?'*'&'*) return 0 ;;   # & survived        -> it was quoted
+        *'?'*=*)
+            echo "${c_no}that link looks truncated by the shell.${c_r}" >&2
+            echo "wrap it in single quotes:" >&2
+            echo "  xray-tun ${c_b}add NAME 'vless://...'${c_r}" >&2
+            echo "${c_dim}(unquoted, bash cuts the link at the first '&' and runs" >&2
+            echo " the rest as background jobs; what is left still parses, as a" >&2
+            echo " plain-TCP server that cannot connect)${c_r}" >&2
+            return 1 ;;
+    esac
+    return 0
+}
+
 case "${1:-status}" in
     on|up|start)     cmd_on ;;
     off|down|stop)   cmd_off ;;
@@ -117,13 +196,14 @@ case "${1:-status}" in
         shift
         # xray-tun add <name> <link>   |   xray-tun add <link>
         case $# in
-          2) $SUDO "$V2X" --install --name "$1" "$2" ;;
-          1) $SUDO "$V2X" --install "$1" ;;
+          2) check_quoted "$2" || exit 2; $SUDO "$V2X" --install --name "$1" "$2" ;;
+          1) check_quoted "$1" || exit 2; $SUDO "$V2X" --install "$1" ;;
           *) echo "usage: xray-tun add [name] 'vless://...'" >&2; exit 2 ;;
         esac ;;
     import)
         shift
         [ $# -ge 1 ] || { echo "usage: xray-tun import 'vless://...'" >&2; exit 2; }
+        check_quoted "$1" || exit 2
         $SUDO "$V2X" --install "$@" ;;
     ls|list)         $SUDO "$V2X" --list ;;
     use|switch)
