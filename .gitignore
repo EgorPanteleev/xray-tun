@@ -8,3 +8,6 @@ zz-server.json
 *.tmp
 *.bak
 *.log
+
+# Generated server profiles (UUIDs, keys)
+servers/

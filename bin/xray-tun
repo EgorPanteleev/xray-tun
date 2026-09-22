@@ -3,6 +3,7 @@
 set -uo pipefail
 
 UNIT=xray-tun.service
+V2X=/usr/local/bin/vless2xray
 CONF_DIR=/etc/xray-tun
 CONF="$CONF_DIR/config.json"
 NETCONF="$CONF_DIR/xray-tun.conf"
@@ -66,6 +67,16 @@ cmd_status() {
     echo "${c_b}dns${c_r}        $(grep -m2 '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd' ')"
     echo "${c_b}exit ip${c_r}    $(exit_ip)"
 
+    local act
+    if [ -L "$CONF_DIR/zz-server.json" ]; then
+        act=$(basename "$(readlink "$CONF_DIR/zz-server.json")" .json)
+        echo "${c_b}server${c_r}     $act"
+    elif [ -e "$CONF_DIR/zz-server.json" ]; then
+        echo "${c_b}server${c_r}     (unnamed; run 'xray-tun ls' to adopt it)"
+    else
+        echo "${c_b}server${c_r}     ${c_no}none configured${c_r} -- xray-tun add ..."
+    fi
+
     conflicts
     return 0
 }
@@ -102,10 +113,30 @@ case "${1:-status}" in
     enable)          $SUDO systemctl enable "$UNIT" && echo "will start at boot" ;;
     disable)         $SUDO systemctl disable "$UNIT" && echo "will not start at boot" ;;
     logs)            shift; $SUDO journalctl -u "$UNIT" -n 100 "${@:--f}" ;;
+    add)
+        shift
+        # xray-tun add <name> <link>   |   xray-tun add <link>
+        case $# in
+          2) $SUDO "$V2X" --install --name "$1" "$2" ;;
+          1) $SUDO "$V2X" --install "$1" ;;
+          *) echo "usage: xray-tun add [name] 'vless://...'" >&2; exit 2 ;;
+        esac ;;
     import)
         shift
         [ $# -ge 1 ] || { echo "usage: xray-tun import 'vless://...'" >&2; exit 2; }
-        $SUDO /usr/local/bin/vless2xray --install "$1" ;;
+        $SUDO "$V2X" --install "$@" ;;
+    ls|list)         $SUDO "$V2X" --list ;;
+    use|switch)
+        shift
+        [ $# -ge 1 ] || { echo "usage: xray-tun use <name>" >&2; exit 2; }
+        $SUDO "$V2X" --use "$1" ;;
+    rm|remove|del)
+        shift
+        [ $# -ge 1 ] || { echo "usage: xray-tun rm <name> [--force]" >&2; exit 2; }
+        $SUDO "$V2X" --remove "$@" ;;
+    show)
+        shift
+        $SUDO "$V2X" --show "$@" ;;
     check)           $SUDO /usr/bin/xray run -dump -confdir "$CONF_DIR" >/dev/null \
                          && echo "${c_ok}config OK${c_r}" \
                          || { echo "${c_no}config INVALID${c_r}"; exit 1; } ;;
@@ -126,7 +157,13 @@ xray-tun -- Xray full-tunnel VPN
   xray-tun enable        start automatically at boot
   xray-tun disable       do not start at boot
 
-  xray-tun import URL    point it at a server from a vless:// link
+servers:
+  xray-tun add NAME URL  add a server from a vless:// link, and use it
+  xray-tun ls            list servers  (* = active)
+  xray-tun use NAME      switch to another server
+  xray-tun rm NAME       delete a server  (--force if it is active)
+  xray-tun show [NAME]   details of a server; --show-link prints its URL
+
   xray-tun check         validate the config without starting
   xray-tun edit          edit /etc/xray-tun/config.json (server settings)
   xray-tun edit-net      edit /etc/xray-tun/xray-tun.conf (routing/DNS knobs)

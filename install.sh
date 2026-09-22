@@ -10,6 +10,8 @@ WITH_POLKIT=0
 command -v xray >/dev/null || { echo "xray not found in PATH" >&2; exit 1; }
 
 install -d -m 0755 /etc/xray-tun /usr/local/lib/xray-tun
+# 0700: profiles hold UUIDs and keys.
+install -d -m 0700 /etc/xray-tun/servers
 
 # Never clobber a config you have already edited.
 for f in config.json xray-tun.conf; do
@@ -37,8 +39,9 @@ fi
 systemctl daemon-reload
 echo
 echo "done. next:"
-echo "  xray-tun import 'vless://...'   # point it at your server"
-echo "  xray-tun on                     # bring the tunnel up"
+echo "  xray-tun add home 'vless://...'  # add a server (repeat for more)"
+echo "  xray-tun ls                      # list them"
+echo "  xray-tun on                      # bring the tunnel up"
 echo
 echo "or edit the config by hand instead:  sudo xray-tun edit"
 echo

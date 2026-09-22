@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
-"""vless2xray -- turn a vless:// share link into an Xray outbound.
+"""vless2xray -- convert vless:// links into Xray outbounds, and manage them.
 
-Writes a drop-in `zz-server.json` holding only the "proxy" outbound. Xray's
--confdir merge replaces same-tag outbounds wholesale, so this overrides the
-placeholder in config.json without touching that file (and without any stale
-transport settings surviving the swap).
+Each server is a named profile in /etc/xray-tun/servers/<name>.json, holding
+only the "proxy" outbound. The active one is /etc/xray-tun/zz-server.json, a
+symlink pointing at the chosen profile.
 
-  vless2xray 'vless://...'              # print the drop-in to stdout
-  vless2xray --outbound 'vless://...'   # print just the outbound object
-  sudo vless2xray --install 'vless://...'   # write it and restart the daemon
-  pbpaste | vless2xray -                # read the link from stdin
+Two facts about `xray run -confdir` make this work, both verified against the
+binary rather than assumed:
+
+  * it does NOT recurse into subdirectories, so servers/ can sit inside the
+    config dir without every profile being loaded at once;
+  * it DOES follow symlinks, so switching profiles is one atomic relink;
+  * it applies files in name order and REPLACES same-tag outbounds, so a
+    drop-in sorting after config.json cleanly overrides the placeholder there
+    with no stale transport settings surviving the swap. Hence "zz-".
+
+  vless2xray 'vless://...'                       # print the drop-in, touch nothing
+  vless2xray --outbound 'vless://...'            # print just the outbound object
+  pbpaste | vless2xray -                         # read the link from stdin
+
+  sudo vless2xray --install --name tokyo 'vless://...'   # add a profile + use it
+  sudo vless2xray --list                                 # list profiles
+  sudo vless2xray --use tokyo                            # switch
+  sudo vless2xray --remove tokyo                         # delete
+  sudo vless2xray --show tokyo                           # details
 """
 
 import argparse
@@ -22,13 +36,24 @@ import sys
 import tempfile
 import urllib.parse as up
 
-CONF_DIR = "/etc/xray-tun"
+# XRAY_TUN_CONFDIR points the whole tool at another config tree -- for tests,
+# or for managing an install that is not the system one. Pointing it elsewhere
+# also drops the root requirement and the service restart, since neither
+# applies to a tree you already own.
+DEFAULT_CONF_DIR = "/etc/xray-tun"
+CONF_DIR = os.environ.get("XRAY_TUN_CONFDIR") or DEFAULT_CONF_DIR
+SYSTEM = os.path.abspath(CONF_DIR) == DEFAULT_CONF_DIR
+SERVERS_DIRNAME = "servers"
+SERVERS_DIR = os.path.join(CONF_DIR, SERVERS_DIRNAME)
 DROPIN = "zz-server.json"
-# Must sort AFTER config.json: xray -confdir applies files in name order,
-# and a file read before config.json gets that file's outbounds prepended,
-# which would leave "direct" as the default outbound instead of "proxy".
+DROPIN_PATH = os.path.join(CONF_DIR, DROPIN)
+# Older versions wrote this; it sorts BEFORE config.json and so demoted the
+# proxy outbound. Removed on sight.
 LEGACY_DROPINS = ("50-server.json",)
 NETCONF = os.path.join(CONF_DIR, "xray-tun.conf")
+SERVICE = "xray-tun.service"
+
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 def die(msg):
@@ -37,6 +62,148 @@ def die(msg):
 
 def warn(msg):
     print(f"vless2xray: warning: {msg}", file=sys.stderr)
+
+
+def slugify(text, fallback="server"):
+    """Turn a link's #remark into a usable profile name."""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", text.strip()).strip("-.")
+    slug = re.sub(r"-{2,}", "-", slug)[:64]
+    return slug if slug and NAME_RE.match(slug) else fallback
+
+
+def check_name(name):
+    if not NAME_RE.match(name):
+        die(f"bad profile name {name!r}: use letters, digits, dot, dash, "
+            "underscore; must start alphanumeric, 64 chars max")
+    return name
+
+
+def need_root(what):
+    if SYSTEM and os.geteuid() != 0:
+        die(f"{what} needs root (try: sudo vless2xray ...)")
+
+
+def require_confdir():
+    if not os.path.isdir(CONF_DIR):
+        die(f"{CONF_DIR} does not exist -- run install.sh first")
+
+
+def profile_path(name):
+    return os.path.join(SERVERS_DIR, name + ".json")
+
+
+def strip_comments(text):
+    """Drop our full-line // headers so the body can be JSON-parsed."""
+    return "\n".join(l for l in text.splitlines()
+                      if not l.lstrip().startswith("//"))
+
+
+def read_meta(path):
+    """Header metadata + a few facts dug out of the JSON body."""
+    meta = {"name": "", "remark": "", "link": "", "server": "?",
+            "transport": "?", "security": "?", "tag": "proxy"}
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except OSError as e:
+        meta["server"] = f"unreadable ({e.strerror})"
+        return meta
+    for line in text.splitlines():
+        m = re.match(r"^//\s*(name|remark|link):\s*(.*)$", line.strip())
+        if m:
+            meta[m.group(1)] = m.group(2).strip()
+    try:
+        body = json.loads(strip_comments(text))
+        ob = body["outbounds"][0]
+        meta["tag"] = ob.get("tag", "proxy")
+        v = ob["settings"]["vnext"][0]
+        meta["server"] = f"{v['address']}:{v['port']}"
+        st = ob.get("streamSettings", {})
+        meta["transport"] = st.get("network", "?")
+        meta["security"] = st.get("security", "none")
+    except (OSError, ValueError, KeyError, IndexError):
+        pass
+    return meta
+
+
+def active_name():
+    """Name of the active profile, or None."""
+    if not os.path.islink(DROPIN_PATH):
+        return None
+    target = os.readlink(DROPIN_PATH)
+    base = os.path.basename(target)
+    return base[:-5] if base.endswith(".json") else None
+
+
+def list_profiles():
+    try:
+        names = [f[:-5] for f in os.listdir(SERVERS_DIR) if f.endswith(".json")]
+    except OSError:
+        return []
+    return sorted(names)
+
+
+def repair_store():
+    """Fix up anything an older version, or a manual edit, left behind.
+
+    Cheap and idempotent, so every entry point calls it first:
+
+      * delete a stale 50-server.json -- it sorts BEFORE config.json and so
+        demotes the proxy outbound (the bug the zz- prefix exists to avoid);
+      * adopt a regular-file zz-server.json from the pre-profiles layout;
+      * drop a dangling active symlink. xray refuses to start on one -- it
+        aborts reading the whole confdir -- so healing it is what keeps
+        `xray-tun on` working after someone deletes a profile by hand.
+    """
+    for stale in LEGACY_DROPINS:
+        sp = os.path.join(CONF_DIR, stale)
+        if os.path.exists(sp):
+            os.remove(sp)
+            print(f"removed stale {sp} (it sorted before config.json)")
+
+    if os.path.islink(DROPIN_PATH):
+        if not os.path.exists(DROPIN_PATH):        # follows the link
+            gone = active_name()
+            os.remove(DROPIN_PATH)
+            warn(f"active profile {gone!r} was missing its file; cleared it "
+                 "(xray cannot start on a dangling link)")
+        return
+
+    if not os.path.isfile(DROPIN_PATH):
+        return
+
+    os.makedirs(SERVERS_DIR, mode=0o700, exist_ok=True)
+    meta = read_meta(DROPIN_PATH)
+    name = check_name(slugify(meta.get("name") or meta.get("remark")
+                              or "default", "default"))
+    while os.path.exists(profile_path(name)):
+        name += "-1"
+    shutil.move(DROPIN_PATH, profile_path(name))
+    os.chmod(profile_path(name), 0o600)
+    link_profile(name)
+    print(f"adopted the existing server as profile {name!r}")
+
+
+def link_profile(name):
+    """Point the drop-in at a profile, atomically."""
+    tmp = DROPIN_PATH + ".tmp"
+    if os.path.lexists(tmp):
+        os.remove(tmp)
+    os.symlink(os.path.join(SERVERS_DIRNAME, name + ".json"), tmp)
+    os.replace(tmp, DROPIN_PATH)
+
+
+def restart_if_running(quiet=False):
+    if not SYSTEM:
+        return False
+    if subprocess.run(["systemctl", "is-active", "--quiet", SERVICE]).returncode == 0:
+        subprocess.run(["systemctl", "restart", SERVICE], check=False)
+        if not quiet:
+            print(f"restarted {SERVICE}")
+        return True
+    if not quiet:
+        print("xray-tun is not running; start it with 'xray-tun on'")
+    return False
 
 
 def default_mark():
@@ -224,15 +391,23 @@ def build_outbound(link, tag, mark):
 
 
 def validate(dropin_text, tag):
-    """Dry-run the real confdir with this drop-in swapped in."""
+    """Dry-run the real confdir with this drop-in swapped in.
+
+    Copies only the top-level .json files -- servers/ is a directory and
+    -confdir does not recurse, so profiles never get merged in by accident.
+    Also checks the merged result actually puts `tag` FIRST: xray picks the
+    first outbound as the default, and an ordering mistake silently sends
+    unmatched traffic out direct instead of through the tunnel.
+    """
     xray = shutil.which("xray")
     if not xray or not os.path.isdir(CONF_DIR):
         return None
     with tempfile.TemporaryDirectory() as td:
         for name in os.listdir(CONF_DIR):
+            src = os.path.join(CONF_DIR, name)
             if name.endswith(".json") and name != DROPIN \
-                    and name not in LEGACY_DROPINS:
-                shutil.copy(os.path.join(CONF_DIR, name), td)
+                    and name not in LEGACY_DROPINS and os.path.isfile(src):
+                shutil.copy(src, td)
         with open(os.path.join(td, DROPIN), "w") as fh:
             fh.write(dropin_text)
         p = subprocess.run([xray, "run", "-dump", "-confdir", td],
@@ -246,81 +421,258 @@ def validate(dropin_text, tag):
         tags = [o.get("tag") for o in merged.get("outbounds", [])]
         if tag not in tags:
             return f"outbound {tag!r} vanished after merge (tags: {tags})"
+        if tags[0] != tag:
+            return (f"outbound {tag!r} is not first after merge (order: {tags}); "
+                    f"unmatched traffic would default to {tags[0]!r}")
     return None
+
+
+def render(outbound, remark, link, name, tag):
+    """A profile file: header metadata xray ignores, then the drop-in."""
+    head = [f"// Generated by vless2xray. Overrides the {tag!r} outbound in config.json.",
+            f"// name: {name}"]
+    if remark:
+        head.append(f"// remark: {remark}")
+    if link:
+        head.append(f"// link: {link}")
+    head.append("// Re-add with:  sudo vless2xray --install --name "
+                f"{name} '<vless://...>'")
+    return "\n".join(head) + "\n" + json.dumps({"outbounds": [outbound]},
+                                                indent=2) + "\n"
+
+
+# ---------------------------------------------------------------- actions
+
+
+def cmd_add(link, name, tag, mark, restart):
+    need_root("--install")
+    require_confdir()
+    repair_store()
+
+    outbound, remark = build_outbound(link, tag, mark)
+    if not name:
+        name = slugify(remark, "server")
+    check_name(name)
+
+    text = render(outbound, remark, link.strip(), name, tag)
+    problem = validate(text, tag)
+    if problem:
+        die(f"refusing to install, merged config is invalid: {problem}")
+
+    os.makedirs(SERVERS_DIR, mode=0o700, exist_ok=True)
+    dest = profile_path(name)
+    existed = os.path.exists(dest)
+    tmp = dest + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, dest)
+    print(("updated" if existed else "added") + f" profile {name!r}"
+          + (f"  ({remark})" if remark else ""))
+
+    was = active_name()
+    if was != name:
+        link_profile(name)
+        print(f"active profile is now {name!r}" + (f" (was {was!r})" if was else ""))
+        restart = restart and True
+    if restart:
+        restart_if_running()
+    return name
+
+
+def cmd_list():
+    require_confdir()
+    repair_store()
+    names = list_profiles()
+    act = active_name()
+    if not names:
+        print("no profiles yet -- add one with: xray-tun add <name> 'vless://...'")
+        if act:
+            warn(f"active profile {act!r} has no file in {SERVERS_DIR}")
+        return
+    width = max(len(n) for n in names)
+    for n in names:
+        m = read_meta(profile_path(n))
+        star = "*" if n == act else " "
+        sec = m["security"] if m["security"] not in ("", "none") else "-"
+        line = f"{star} {n.ljust(width)}  {m['server']}  [{m['transport']}/{sec}]"
+        if m["remark"] and m["remark"] != n:
+            line += f"  {m['remark']}"
+        print(line)
+    if act and act not in names:
+        warn(f"active profile {act!r} has no file in {SERVERS_DIR}")
+    elif not act:
+        warn("no active profile; config.json's placeholder is in use")
+
+
+def cmd_use(name, restart):
+    need_root("--use")
+    require_confdir()
+    repair_store()
+    check_name(name)
+    if not os.path.exists(profile_path(name)):
+        avail = ", ".join(list_profiles()) or "none"
+        die(f"no profile {name!r} (have: {avail})")
+    if active_name() == name:
+        print(f"{name!r} is already active")
+        return
+    with open(profile_path(name)) as fh:
+        text = fh.read()
+    problem = validate(text, read_meta(profile_path(name))["tag"])
+    if problem:
+        die(f"refusing to switch, {name!r} produces an invalid config: {problem}")
+    link_profile(name)
+    print(f"active profile is now {name!r}")
+    if restart:
+        restart_if_running()
+
+
+def cmd_remove(name, force, restart):
+    need_root("--remove")
+    require_confdir()
+    repair_store()
+    check_name(name)
+    path = profile_path(name)
+    if not os.path.exists(path):
+        avail = ", ".join(list_profiles()) or "none"
+        die(f"no profile {name!r} (have: {avail})")
+
+    others = [n for n in list_profiles() if n != name]
+    if active_name() == name and not force:
+        hint = (f"switch first: xray-tun use {others[0]}"
+                if others else "it is the only profile")
+        die(f"{name!r} is the active profile; {hint}. Use --force to remove anyway.")
+
+    os.remove(path)
+    print(f"removed profile {name!r}")
+
+    if active_name() == name:
+        # Forced removal of the active one: don't leave a dangling symlink,
+        # xray would fail to start on it.
+        if os.path.lexists(DROPIN_PATH):
+            os.remove(DROPIN_PATH)
+        if others:
+            print(f"no active profile now; pick one: xray-tun use {others[0]}")
+        else:
+            print("no profiles left; config.json's placeholder is in use again")
+        if restart:
+            restart_if_running(quiet=True)
+
+
+def cmd_show(name, want_link):
+    require_confdir()
+    repair_store()
+    if not name:
+        name = active_name()
+        if not name:
+            die("no active profile; name one, or add a profile first")
+    check_name(name)
+    path = profile_path(name)
+    if not os.path.exists(path):
+        avail = ", ".join(list_profiles()) or "none"
+        die(f"no profile {name!r} (have: {avail})")
+    m = read_meta(path)
+    if want_link:
+        if not m["link"]:
+            die(f"no original link stored for {name!r}")
+        print(m["link"])
+        return
+    print(f"name      {name}" + ("  (active)" if active_name() == name else ""))
+    if m["remark"]:
+        print(f"remark    {m['remark']}")
+    print(f"server    {m['server']}")
+    print(f"transport {m['transport']}")
+    print(f"security  {m['security']}")
+    print(f"outbound  {m['tag']}")
+    print(f"file      {path}")
+    if m["link"]:
+        print("link      (stored; print it with --show-link)")
 
 
 def main():
     ap = argparse.ArgumentParser(
         prog="vless2xray",
-        description="Convert a vless:// share link into an Xray outbound "
-                    "drop-in for the xray-tun daemon.")
-    ap.add_argument("link", nargs="?", default="-",
+        description="Convert vless:// links into Xray outbounds and manage "
+                    "them as named profiles for the xray-tun daemon.")
+    ap.add_argument("link", nargs="?", default=None,
                     help="the vless:// URL, or - to read it from stdin")
-    ap.add_argument("--tag", default="proxy",
-                    help="outbound tag to override (default: proxy)")
-    ap.add_argument("--mark", type=int, default=None,
-                    help=f"sockopt fwmark (default: from {NETCONF}, else 255)")
-    ap.add_argument("--no-mark", action="store_true",
-                    help="omit sockopt.mark (only if you are not using the TUN)")
-    ap.add_argument("--outbound", action="store_true",
-                    help="print just the outbound object, not the drop-in file")
-    ap.add_argument("-o", "--output", metavar="FILE",
-                    help="write to FILE instead of stdout")
-    ap.add_argument("--install", action="store_true",
-                    help=f"write {CONF_DIR}/{DROPIN} and restart the daemon")
-    ap.add_argument("--no-restart", action="store_true",
-                    help="with --install, do not restart the service")
+
+    store = ap.add_argument_group("profile management (all need root)")
+    store.add_argument("--install", action="store_true",
+                       help="add the link as a profile and make it active")
+    store.add_argument("--name", metavar="NAME",
+                       help="profile name (default: slug of the link's #remark)")
+    store.add_argument("--list", action="store_true", help="list profiles")
+    store.add_argument("--use", metavar="NAME", help="switch to a profile")
+    store.add_argument("--remove", metavar="NAME", help="delete a profile")
+    store.add_argument("--force", action="store_true",
+                       help="with --remove, allow removing the active profile")
+    store.add_argument("--show", metavar="NAME", nargs="?", const="",
+                       help="show a profile's details (default: the active one)")
+    store.add_argument("--show-link", action="store_true",
+                       help="with --show, print the stored vless:// link instead")
+    store.add_argument("--no-restart", action="store_true",
+                       help="do not restart the service after a change")
+
+    conv = ap.add_argument_group("conversion")
+    conv.add_argument("--tag", default="proxy",
+                      help="outbound tag to override (default: proxy)")
+    conv.add_argument("--mark", type=int, default=None,
+                      help=f"sockopt fwmark (default: from {NETCONF}, else 255)")
+    conv.add_argument("--no-mark", action="store_true",
+                      help="omit sockopt.mark (only if you are not using the TUN)")
+    conv.add_argument("--outbound", action="store_true",
+                      help="print just the outbound object, not the whole file")
+    conv.add_argument("-o", "--output", metavar="FILE",
+                      help="write to FILE instead of stdout")
     args = ap.parse_args()
 
-    link = sys.stdin.read() if args.link == "-" else args.link
-    links = [l for l in (x.strip() for x in link.splitlines()) if l]
+    restart = not args.no_restart
+
+    # --- store actions, one at a time ---
+    picked = [n for n, v in (("--list", args.list), ("--use", args.use),
+                             ("--remove", args.remove),
+                             ("--show", args.show is not None)) if v]
+    if len(picked) > 1:
+        die(f"pick one of {', '.join(picked)}, not several")
+    if picked and args.install:
+        die(f"--install cannot be combined with {picked[0]}")
+
+    if args.list:
+        return cmd_list()
+    if args.use:
+        return cmd_use(args.use, restart)
+    if args.remove:
+        return cmd_remove(args.remove, args.force, restart)
+    if args.show is not None:
+        return cmd_show(args.show or None, args.show_link)
+
+    # --- conversion (and optionally adding a profile) ---
+    if args.link is None:
+        if sys.stdin.isatty():
+            ap.error("no link given (pass a vless:// URL, - for stdin, "
+                     "or a profile action such as --list)")
+        args.link = "-"
+    raw = sys.stdin.read() if args.link == "-" else args.link
+    links = [l for l in (x.strip() for x in raw.splitlines()) if l]
     if not links:
         die("no link given")
     if len(links) > 1:
         die(f"got {len(links)} links; pass one at a time")
+    link = links[0]
 
     mark = None if args.no_mark else (args.mark if args.mark is not None
                                       else default_mark())
-    outbound, remark = build_outbound(links[0], args.tag, mark)
 
+    if args.install:
+        return cmd_add(link, args.name, args.tag, mark, restart)
+
+    outbound, remark = build_outbound(link, args.tag, mark)
     if args.outbound:
         text = json.dumps(outbound, indent=2) + "\n"
     else:
-        header = "// Generated by vless2xray. Overrides the %r outbound in config.json.\n" % args.tag
-        if remark:
-            header += f"// Server: {remark}\n"
-        header += "// Regenerate:  sudo vless2xray --install 'vless://...'\n"
-        text = header + json.dumps({"outbounds": [outbound]}, indent=2) + "\n"
-
-    if args.install:
-        if os.geteuid() != 0:
-            die("--install needs root (try: sudo vless2xray --install ...)")
-        if not os.path.isdir(CONF_DIR):
-            die(f"{CONF_DIR} does not exist -- run install.sh first")
-        problem = validate(text, args.tag)
-        if problem:
-            die(f"refusing to install, merged config is invalid: {problem}")
-        dest = os.path.join(CONF_DIR, DROPIN)
-        tmp = dest + ".tmp"
-        with open(tmp, "w") as fh:
-            fh.write(text)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, dest)
-        print(f"wrote {dest}" + (f"  ({remark})" if remark else ""))
-        for stale in LEGACY_DROPINS:
-            sp = os.path.join(CONF_DIR, stale)
-            if os.path.exists(sp):
-                os.remove(sp)
-                print(f"removed stale {sp} (it sorted before config.json)")
-        if args.no_restart:
-            print("not restarting; run 'xray-tun restart' to apply")
-        elif subprocess.run(["systemctl", "is-active", "--quiet",
-                             "xray-tun.service"]).returncode == 0:
-            subprocess.run(["systemctl", "restart", "xray-tun.service"], check=False)
-            print("restarted xray-tun.service")
-        else:
-            print("xray-tun is not running; start it with 'xray-tun on'")
-        return
+        text = render(outbound, remark, link,
+                      args.name or slugify(remark, "server"), args.tag)
 
     if args.output:
         with open(args.output, "w") as fh:

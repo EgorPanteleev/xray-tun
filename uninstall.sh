@@ -12,4 +12,5 @@ rm -f /etc/systemd/system/xray-tun.service \
       /etc/polkit-1/rules.d/49-xray-tun.rules
 rmdir /usr/local/lib/xray-tun 2>/dev/null
 systemctl daemon-reload
-echo "removed. config left in /etc/xray-tun (delete it by hand if you want)."
+echo "removed. config and saved servers left in /etc/xray-tun"
+echo "(delete them by hand if you want: rm -rf /etc/xray-tun)"
