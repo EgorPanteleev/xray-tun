@@ -1,0 +1,39 @@
+[Unit]
+Description=Xray TUN full-tunnel VPN
+Documentation=https://xtls.github.io/
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# -dump merges and validates the config without creating the TUN device,
+# so a typo fails here instead of half-way through bringing the link up.
+ExecStartPre=/bin/sh -c '/usr/bin/xray run -dump -confdir /etc/xray-tun >/dev/null'
+
+ExecStart=/usr/bin/xray run -confdir /etc/xray-tun
+
+# xray makes the device; these add the addressing, routes and DNS.
+ExecStartPost=/usr/local/lib/xray-tun/netctl.sh up
+ExecStopPost=/usr/local/lib/xray-tun/netctl.sh down
+
+# Needs root: creates a TUN device, edits routing rules, sets SO_MARK.
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_DAC_OVERRIDE CAP_SYS_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+RuntimeDirectory=xray-tun
+RuntimeDirectoryPreserve=yes
+
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+
+LimitNOFILE=1048576
+LimitNPROC=10000
+
+ProtectHome=read-only
+ProtectSystem=false
+NoNewPrivileges=false
+
+[Install]
+WantedBy=multi-user.target

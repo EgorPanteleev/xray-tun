@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""vless2xray -- turn a vless:// share link into an Xray outbound.
+
+Writes a drop-in `zz-server.json` holding only the "proxy" outbound. Xray's
+-confdir merge replaces same-tag outbounds wholesale, so this overrides the
+placeholder in config.json without touching that file (and without any stale
+transport settings surviving the swap).
+
+  vless2xray 'vless://...'              # print the drop-in to stdout
+  vless2xray --outbound 'vless://...'   # print just the outbound object
+  sudo vless2xray --install 'vless://...'   # write it and restart the daemon
+  pbpaste | vless2xray -                # read the link from stdin
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse as up
+
+CONF_DIR = "/etc/xray-tun"
+DROPIN = "zz-server.json"
+# Must sort AFTER config.json: xray -confdir applies files in name order,
+# and a file read before config.json gets that file's outbounds prepended,
+# which would leave "direct" as the default outbound instead of "proxy".
+LEGACY_DROPINS = ("50-server.json",)
+NETCONF = os.path.join(CONF_DIR, "xray-tun.conf")
+
+
+def die(msg):
+    sys.exit(f"vless2xray: {msg}")
+
+
+def warn(msg):
+    print(f"vless2xray: warning: {msg}", file=sys.stderr)
+
+
+def default_mark():
+    """Keep the fwmark in step with xray-tun.conf, since the two must agree."""
+    try:
+        with open(NETCONF) as fh:
+            m = re.search(r"^\s*FWMARK=(\d+)", fh.read(), re.M)
+            if m:
+                return int(m.group(1))
+    except OSError:
+        pass
+    return 255
+
+
+def parse_link(link):
+    link = link.strip()
+    if not link:
+        die("empty input")
+    if link.startswith(("vmess://", "trojan://", "ss://", "hysteria2://", "tuic://")):
+        die(f"{link.split('://')[0]}:// links are not supported, only vless://")
+    if not link.startswith("vless://"):
+        die("not a vless:// link")
+
+    u = up.urlsplit(link)
+
+    uuid = up.unquote(u.username or "")
+    if not uuid:
+        die("no UUID in the link (expected vless://UUID@host:port?...)")
+
+    host = u.hostname
+    if not host:
+        die("no server address in the link")
+    try:
+        port = u.port
+    except ValueError:
+        die("invalid port")
+    if not port:
+        die("no server port in the link")
+
+    # Query values arrive percent-encoded; take the last if repeated.
+    q = {k: v[-1] for k, v in up.parse_qs(u.query, keep_blank_values=True).items()}
+    remark = up.unquote(u.fragment) if u.fragment else ""
+    return uuid, host, port, q, remark
+
+
+def build_stream(q, address):
+    net = (q.get("type") or "tcp").lower()
+    sec = (q.get("security") or "none").lower()
+    stream = {"network": "tcp" if net in ("tcp", "raw") else net}
+
+    # ---- security ----
+    sni = q.get("sni") or q.get("peer") or q.get("host") or ""
+    fp = q.get("fp") or ""
+    insecure = q.get("allowInsecure", q.get("insecure", "0")) in ("1", "true", "True")
+    alpn = [a for a in (q.get("alpn", "").split(",")) if a]
+
+    if sec in ("tls", "xtls"):
+        if sec == "xtls":
+            warn("xtls is obsolete in modern Xray; emitting tls "
+                 "(use flow=xtls-rprx-vision with reality or tls instead)")
+        stream["security"] = "tls"
+        tls = {"serverName": sni or address}
+        if fp:
+            tls["fingerprint"] = fp
+        if alpn:
+            tls["alpn"] = alpn
+        if insecure:
+            tls["allowInsecure"] = True
+            warn("allowInsecure=1 -- certificate checking is off for this server")
+        stream["tlsSettings"] = tls
+
+    elif sec == "reality":
+        pbk = q.get("pbk", "")
+        if not pbk:
+            die("security=reality but no pbk (public key) in the link")
+        stream["security"] = "reality"
+        reality = {
+            "serverName": sni,
+            "fingerprint": fp or "chrome",
+            "publicKey": pbk,
+            "shortId": q.get("sid", ""),
+            "spiderX": q.get("spx", "/"),
+        }
+        if q.get("pqv"):                      # post-quantum cert verify (Xray 25.x+)
+            reality["mldsa65Verify"] = q["pqv"]
+        stream["realitySettings"] = reality
+        if not sni:
+            warn("reality link has no sni -- the handshake will very likely fail")
+
+    elif sec in ("none", ""):
+        stream["security"] = "none"
+    else:
+        die(f"unknown security={sec!r}")
+
+    # ---- transport ----
+    path = up.unquote(q.get("path", "")) or "/"
+    hosthdr = q.get("host", "")
+
+    if stream["network"] == "tcp":
+        if (q.get("headerType") or "none").lower() == "http":
+            req = {"path": [path]}
+            if hosthdr:
+                req["headers"] = {"Host": hosthdr.split(",")}
+            stream["tcpSettings"] = {"header": {"type": "http", "request": req}}
+
+    elif stream["network"] == "ws":
+        ws = {"path": path}
+        if hosthdr:
+            ws["host"] = hosthdr
+        stream["wsSettings"] = ws
+
+    elif stream["network"] == "httpupgrade":
+        hu = {"path": path}
+        if hosthdr:
+            hu["host"] = hosthdr
+        stream["httpupgradeSettings"] = hu
+
+    elif stream["network"] in ("xhttp", "splithttp"):
+        stream["network"] = "xhttp"
+        xh = {"path": path, "mode": q.get("mode", "auto")}
+        if hosthdr:
+            xh["host"] = hosthdr
+        if q.get("extra"):
+            try:
+                xh["extra"] = json.loads(up.unquote(q["extra"]))
+            except json.JSONDecodeError:
+                warn("could not parse the 'extra' parameter as JSON; dropped")
+        stream["xhttpSettings"] = xh
+
+    elif stream["network"] in ("grpc", "gun"):
+        stream["network"] = "grpc"
+        grpc = {"serviceName": up.unquote(q.get("serviceName", ""))}
+        if q.get("mode", "gun") == "multi":
+            grpc["multiMode"] = True
+        if q.get("authority"):
+            grpc["authority"] = q["authority"]
+        stream["grpcSettings"] = grpc
+
+    elif stream["network"] in ("h2", "http"):
+        stream["network"] = "h2"
+        h2 = {"path": path}
+        if hosthdr:
+            h2["host"] = hosthdr.split(",")
+        stream["httpSettings"] = h2
+
+    elif stream["network"] == "kcp":
+        kcp = {"header": {"type": q.get("headerType", "none")}}
+        if q.get("seed"):
+            kcp["seed"] = up.unquote(q["seed"])
+        stream["kcpSettings"] = kcp
+
+    elif stream["network"] == "quic":
+        stream["quicSettings"] = {
+            "security": q.get("quicSecurity", "none"),
+            "key": up.unquote(q.get("key", "")),
+            "header": {"type": q.get("headerType", "none")},
+        }
+    else:
+        die(f"unsupported transport type={stream['network']!r}")
+
+    return stream
+
+
+def build_outbound(link, tag, mark):
+    uuid, host, port, q, remark = parse_link(link)
+
+    user = {"id": uuid, "encryption": q.get("encryption", "none")}
+    if q.get("flow"):
+        user["flow"] = q["flow"]
+    if q.get("level"):
+        user["level"] = int(q["level"])
+
+    stream = build_stream(q, host)
+    if mark is not None:
+        stream["sockopt"] = {"mark": mark}
+
+    return {
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {"vnext": [{"address": host, "port": port,
+                                "users": [user]}]},
+        "streamSettings": stream,
+        "mux": {"enabled": False},
+    }, remark
+
+
+def validate(dropin_text, tag):
+    """Dry-run the real confdir with this drop-in swapped in."""
+    xray = shutil.which("xray")
+    if not xray or not os.path.isdir(CONF_DIR):
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        for name in os.listdir(CONF_DIR):
+            if name.endswith(".json") and name != DROPIN \
+                    and name not in LEGACY_DROPINS:
+                shutil.copy(os.path.join(CONF_DIR, name), td)
+        with open(os.path.join(td, DROPIN), "w") as fh:
+            fh.write(dropin_text)
+        p = subprocess.run([xray, "run", "-dump", "-confdir", td],
+                           capture_output=True, text=True)
+        if p.returncode != 0:
+            return p.stderr.strip().splitlines()[-1] if p.stderr.strip() else "invalid"
+        try:
+            merged = json.loads(p.stdout)
+        except json.JSONDecodeError:
+            return "xray produced output that is not JSON"
+        tags = [o.get("tag") for o in merged.get("outbounds", [])]
+        if tag not in tags:
+            return f"outbound {tag!r} vanished after merge (tags: {tags})"
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="vless2xray",
+        description="Convert a vless:// share link into an Xray outbound "
+                    "drop-in for the xray-tun daemon.")
+    ap.add_argument("link", nargs="?", default="-",
+                    help="the vless:// URL, or - to read it from stdin")
+    ap.add_argument("--tag", default="proxy",
+                    help="outbound tag to override (default: proxy)")
+    ap.add_argument("--mark", type=int, default=None,
+                    help=f"sockopt fwmark (default: from {NETCONF}, else 255)")
+    ap.add_argument("--no-mark", action="store_true",
+                    help="omit sockopt.mark (only if you are not using the TUN)")
+    ap.add_argument("--outbound", action="store_true",
+                    help="print just the outbound object, not the drop-in file")
+    ap.add_argument("-o", "--output", metavar="FILE",
+                    help="write to FILE instead of stdout")
+    ap.add_argument("--install", action="store_true",
+                    help=f"write {CONF_DIR}/{DROPIN} and restart the daemon")
+    ap.add_argument("--no-restart", action="store_true",
+                    help="with --install, do not restart the service")
+    args = ap.parse_args()
+
+    link = sys.stdin.read() if args.link == "-" else args.link
+    links = [l for l in (x.strip() for x in link.splitlines()) if l]
+    if not links:
+        die("no link given")
+    if len(links) > 1:
+        die(f"got {len(links)} links; pass one at a time")
+
+    mark = None if args.no_mark else (args.mark if args.mark is not None
+                                      else default_mark())
+    outbound, remark = build_outbound(links[0], args.tag, mark)
+
+    if args.outbound:
+        text = json.dumps(outbound, indent=2) + "\n"
+    else:
+        header = "// Generated by vless2xray. Overrides the %r outbound in config.json.\n" % args.tag
+        if remark:
+            header += f"// Server: {remark}\n"
+        header += "// Regenerate:  sudo vless2xray --install 'vless://...'\n"
+        text = header + json.dumps({"outbounds": [outbound]}, indent=2) + "\n"
+
+    if args.install:
+        if os.geteuid() != 0:
+            die("--install needs root (try: sudo vless2xray --install ...)")
+        if not os.path.isdir(CONF_DIR):
+            die(f"{CONF_DIR} does not exist -- run install.sh first")
+        problem = validate(text, args.tag)
+        if problem:
+            die(f"refusing to install, merged config is invalid: {problem}")
+        dest = os.path.join(CONF_DIR, DROPIN)
+        tmp = dest + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, dest)
+        print(f"wrote {dest}" + (f"  ({remark})" if remark else ""))
+        for stale in LEGACY_DROPINS:
+            sp = os.path.join(CONF_DIR, stale)
+            if os.path.exists(sp):
+                os.remove(sp)
+                print(f"removed stale {sp} (it sorted before config.json)")
+        if args.no_restart:
+            print("not restarting; run 'xray-tun restart' to apply")
+        elif subprocess.run(["systemctl", "is-active", "--quiet",
+                             "xray-tun.service"]).returncode == 0:
+            subprocess.run(["systemctl", "restart", "xray-tun.service"], check=False)
+            print("restarted xray-tun.service")
+        else:
+            print("xray-tun is not running; start it with 'xray-tun on'")
+        return
+
+    if args.output:
+        with open(args.output, "w") as fh:
+            fh.write(text)
+        print(f"wrote {args.output}", file=sys.stderr)
+    else:
+        sys.stdout.write(text)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+// Optional: let members of the "wheel" group start/stop xray-tun.service
+// without a password prompt, so `xray-tun on|off` is a single keystroke.
+// Installed only when you run: sudo ./install.sh --polkit
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.systemd1.manage-units" &&
+        action.lookup("unit") == "xray-tun.service" &&
+        subject.isInGroup("wheel") && subject.local && subject.active) {
+        return polkit.Result.YES;
+    }
+});

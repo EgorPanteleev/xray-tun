@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# xray-tun -- enable/disable the Xray full-tunnel VPN daemon.
+set -uo pipefail
+
+UNIT=xray-tun.service
+CONF_DIR=/etc/xray-tun
+CONF="$CONF_DIR/config.json"
+NETCONF="$CONF_DIR/xray-tun.conf"
+
+# shellcheck source=/dev/null
+TUN_NAME=xtun0; RT_TABLE=8888; PREF_MARK=7080; PREF_MAIN=7100
+[ -r "$NETCONF" ] && . "$NETCONF"
+
+if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+
+c_ok=$'\033[32m'; c_no=$'\033[31m'; c_dim=$'\033[2m'; c_b=$'\033[1m'; c_r=$'\033[0m'
+[ -t 1 ] || { c_ok=""; c_no=""; c_dim=""; c_b=""; c_r=""; }
+
+is_on() { systemctl is-active --quiet "$UNIT"; }
+
+exit_ip() {
+    local ip
+    ip=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null) \
+        || ip=$(curl -s --max-time 8 https://ifconfig.me 2>/dev/null)
+    [ -n "${ip:-}" ] && echo "$ip" || echo "unreachable"
+}
+
+cmd_on() {
+    $SUDO systemctl start "$UNIT" || return 1
+    sleep 1
+    if is_on; then
+        echo "${c_ok}tunnel up${c_r}  ${c_dim}(exit IP: $(exit_ip))${c_r}"
+    else
+        echo "${c_no}failed to start${c_r} -- run: xray-tun logs" >&2
+        return 1
+    fi
+}
+
+cmd_off() {
+    $SUDO systemctl stop "$UNIT" || return 1
+    echo "${c_ok}tunnel down${c_r}  ${c_dim}(exit IP: $(exit_ip))${c_r}"
+}
+
+cmd_status() {
+    if is_on; then
+        echo "${c_b}state${c_r}      ${c_ok}running${c_r}"
+    else
+        echo "${c_b}state${c_r}      ${c_no}stopped${c_r}"
+    fi
+
+    if systemctl is-enabled --quiet "$UNIT" 2>/dev/null; then
+        echo "${c_b}at boot${c_r}    enabled"
+    else
+        echo "${c_b}at boot${c_r}    disabled"
+    fi
+
+    local dev rules
+    dev=$(ip -br addr show dev "$TUN_NAME" 2>/dev/null)
+    echo "${c_b}device${c_r}     ${dev:-absent}"
+
+    rules=$(ip rule show pref "$PREF_MAIN" 2>/dev/null)
+    echo "${c_b}rule${c_r}       ${rules:-absent}"
+    rules=$(ip rule show pref "$PREF_MARK" 2>/dev/null)
+    echo "${c_b}mark rule${c_r}  ${rules:-absent}"
+    echo "${c_b}table${c_r}      $(ip route show table "$RT_TABLE" 2>/dev/null | head -1 || echo empty)"
+    echo "${c_b}dns${c_r}        $(grep -m2 '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | paste -sd' ')"
+    echo "${c_b}exit ip${c_r}    $(exit_ip)"
+
+    conflicts
+    return 0
+}
+
+# Another VPN fighting us for traffic. Most clients (sing-box, wireguard-tools,
+# clash) do it with policy routing rather than a default route in "main", so
+# check every table an ip rule points at, not just main.
+conflicts() {
+    local found="" t dev tables
+    dev=$(ip route show default 2>/dev/null \
+          | grep -vE "dev ${TUN_NAME}([[:space:]]|$)" \
+          | grep -oE 'dev [^ ]+' | awk '{print $2}' \
+          | grep -E '^(tun|tap|wg|utun|proton|nordlynx|mullvad)' || true)
+    [ -n "$dev" ] && found="$dev (main table)"
+
+    tables=$(ip rule show 2>/dev/null \
+             | awk '{for (i=1;i<=NF;i++) if ($i=="lookup") print $(i+1)}' \
+             | sort -u | grep -vE "^(local|main|default|${RT_TABLE})$" || true)
+    for t in $tables; do
+        dev=$(ip route show table "$t" 2>/dev/null | awk '/^default/{print $NF; exit}')
+        [ -n "$dev" ] && [ "$dev" != "$TUN_NAME" ] && found="${found:+$found, }$dev (table $t)"
+    done
+
+    [ -n "$found" ] && echo "${c_no}conflict${c_r}   another tunnel is capturing traffic: $found"
+    return 0
+}
+
+case "${1:-status}" in
+    on|up|start)     cmd_on ;;
+    off|down|stop)   cmd_off ;;
+    toggle)          if is_on; then cmd_off; else cmd_on; fi ;;
+    restart)         $SUDO systemctl restart "$UNIT" && sleep 1 && cmd_status ;;
+    status|"")       cmd_status ;;
+    enable)          $SUDO systemctl enable "$UNIT" && echo "will start at boot" ;;
+    disable)         $SUDO systemctl disable "$UNIT" && echo "will not start at boot" ;;
+    logs)            shift; $SUDO journalctl -u "$UNIT" -n 100 "${@:--f}" ;;
+    import)
+        shift
+        [ $# -ge 1 ] || { echo "usage: xray-tun import 'vless://...'" >&2; exit 2; }
+        $SUDO /usr/local/bin/vless2xray --install "$1" ;;
+    check)           $SUDO /usr/bin/xray run -dump -confdir "$CONF_DIR" >/dev/null \
+                         && echo "${c_ok}config OK${c_r}" \
+                         || { echo "${c_no}config INVALID${c_r}"; exit 1; } ;;
+    edit)            $SUDO "${EDITOR:-nano}" "$CONF" && "$0" check ;;
+    edit-net)        $SUDO "${EDITOR:-nano}" "$NETCONF" ;;
+    ip)              exit_ip ;;
+    -h|--help|help)
+        cat <<'USAGE'
+xray-tun -- Xray full-tunnel VPN
+
+  xray-tun on            start the tunnel now
+  xray-tun off           stop it, restore normal routing
+  xray-tun toggle        flip it
+  xray-tun restart       restart (after a config change)
+  xray-tun status        state, device, routes, DNS, exit IP  [default]
+  xray-tun ip            print the current exit IP
+
+  xray-tun enable        start automatically at boot
+  xray-tun disable       do not start at boot
+
+  xray-tun import URL    point it at a server from a vless:// link
+  xray-tun check         validate the config without starting
+  xray-tun edit          edit /etc/xray-tun/config.json (server settings)
+  xray-tun edit-net      edit /etc/xray-tun/xray-tun.conf (routing/DNS knobs)
+  xray-tun logs [args]   journalctl for the service (follows by default)
+USAGE
+        ;;
+    *) echo "unknown command: $1 (try: xray-tun help)" >&2; exit 2 ;;
+esac

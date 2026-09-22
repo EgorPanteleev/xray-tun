@@ -1,0 +1,128 @@
+// /etc/xray-tun/config.json  -- Xray full-tunnel (TUN) daemon
+// Xray supports // comments in config files.
+//
+// EDIT THE "proxy" OUTBOUND BELOW to point at your own server -- or don't,
+// and let `xray-tun import 'vless://...'` generate 50-server.json instead.
+// Xray's -confdir merge replaces same-tag outbounds wholesale, so that
+// drop-in overrides the "proxy" outbound here and this file stays untouched.
+// Everything else is wired up already.
+{
+  "log": {
+    "loglevel": "warning"
+  },
+
+  "inbounds": [
+    // The TUN device. Xray creates it; netctl.sh gives it an address+routes.
+    // Keep "name"/"mtu" in sync with /etc/xray-tun/xray-tun.conf.
+    {
+      "tag": "tun-in",
+      "protocol": "tun",
+      "settings": {
+        "name": "xtun0",
+        "mtu": 1500
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        "routeOnly": false
+      }
+    },
+
+    // Optional local SOCKS5, handy for testing the outbound without the TUN.
+    // 10808 is used because 8080/10809 belong to the stock xray.service.
+    {
+      "tag": "socks-in",
+      "protocol": "socks",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "settings": { "auth": "noauth", "udp": true },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    }
+  ],
+
+  "outbounds": [
+    // ---------------------------------------------------------------
+    // YOUR SERVER. Replace address/port/id/realitySettings with yours.
+    // sockopt.mark MUST stay -- it is what stops the routing loop.
+    // ---------------------------------------------------------------
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "REPLACE.WITH.YOUR.SERVER",
+            "port": 443,
+            "users": [
+              {
+                "id": "00000000-0000-0000-0000-000000000000",
+                "encryption": "none",
+                "flow": ""
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "REPLACE.WITH.YOUR.SNI",
+          "fingerprint": "chrome",
+          "publicKey": "REPLACE_WITH_YOUR_REALITY_PUBLIC_KEY",
+          "shortId": "",
+          "spiderX": "/"
+        },
+        "sockopt": { "mark": 255 }
+      },
+      "mux": { "enabled": false }
+    },
+
+    // Direct escape hatch. Also marked, so it never re-enters the TUN.
+    {
+      "tag": "direct",
+      "protocol": "freedom",
+      "settings": { "domainStrategy": "AsIs" },
+      "streamSettings": { "sockopt": { "mark": 255 } }
+    },
+
+    {
+      "tag": "block",
+      "protocol": "blackhole",
+      "settings": { "response": { "type": "none" } }
+    }
+  ],
+
+  "routing": {
+    // AsIs = never do an internal DNS lookup just to pick a route.
+    // Switch to "IPIfNonMatch" if you add geoip/geosite rules that need it.
+    "domainStrategy": "AsIs",
+    "rules": [
+      // Defence in depth: LAN/loopback already bypasses at the ip-rule layer.
+      {
+        "type": "field",
+        "ip": ["geoip:private"],
+        "outboundTag": "direct"
+      },
+
+      // IPv6 -> blackhole, so apps fail fast and fall back to IPv4 instead of
+      // hanging. Delete this rule if your server does IPv6 and you set
+      // IPV6_MODE=tunnel in xray-tun.conf.
+      {
+        "type": "field",
+        "ip": ["::/0"],
+        "outboundTag": "block"
+      },
+
+      // Everything else goes out through the server.
+      {
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": "proxy"
+      }
+    ]
+  }
+}
