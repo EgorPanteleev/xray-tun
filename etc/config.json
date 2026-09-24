@@ -11,6 +11,20 @@
     "loglevel": "warning"
   },
 
+  // Built-in resolver, and the reason it exists: glibc does not cache, so
+  // without this EVERY name lookup pays a full round trip down the tunnel --
+  // measured at 300-1300 ms each, on repeats of the same domain. With the
+  // cache, repeats are 0 ms.
+  //
+  // queryStrategy UseIPv4 is deliberate: IPv6 is blackholed below, so asking
+  // for AAAA would spend a round trip on an address we refuse to connect to.
+  // This way AAAA is answered empty, instantly.
+  "dns": {
+    "servers": ["1.1.1.1", "8.8.8.8"],
+    "queryStrategy": "UseIPv4",
+    "disableCache": false
+  },
+
   "inbounds": [
     // The TUN device. Xray creates it; netctl.sh gives it an address+routes.
     // Keep "name"/"mtu" in sync with /etc/xray-tun/xray-tun.conf.
@@ -93,6 +107,18 @@
       "tag": "block",
       "protocol": "blackhole",
       "settings": { "response": { "type": "none" } }
+    },
+
+    // Answers DNS from the cache above instead of forwarding every query.
+    // nonIPQuery "skip" passes anything that is not A/AAAA (MX, TXT, and the
+    // HTTPS/type-65 records browsers now ask for constantly) straight
+    // through. Do NOT add "blockTypes": [28] here to suppress AAAA -- it
+    // makes those queries time out rather than answer empty, which is slower
+    // than doing nothing at all.
+    {
+      "tag": "dns-out",
+      "protocol": "dns",
+      "settings": { "nonIPQuery": "skip" }
     }
   ],
 
@@ -101,6 +127,15 @@
     // Switch to "IPIfNonMatch" if you add geoip/geosite rules that need it.
     "domainStrategy": "AsIs",
     "rules": [
+      // DNS first, so lookups are served from the cache rather than tunnelled
+      // one by one.
+      {
+        "type": "field",
+        "inboundTag": ["tun-in", "socks-in"],
+        "port": 53,
+        "outboundTag": "dns-out"
+      },
+
       // Defence in depth: LAN/loopback already bypasses at the ip-rule layer.
       {
         "type": "field",

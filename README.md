@@ -287,8 +287,35 @@ so your router, printer and SSH-to-a-box-on-the-couch still work.
 
 ### DNS
 
+Xray's built-in resolver answers lookups, with a cache. This matters more than
+it sounds: glibc does not cache at all, so without it every name lookup — including
+repeats of the same domain seconds apart — pays a full round trip down the
+tunnel. Measured on a real link:
+
+| | cold | repeat |
+|---|---|---|
+| straight to 1.1.1.1 through the tunnel | 308–587 ms | 308–587 ms |
+| built-in resolver with cache | 78–500 ms | **0 ms** |
+
+`queryStrategy` is `UseIPv4` on purpose. IPv6 is blackholed (below), so asking
+for AAAA spends a round trip on an address we then refuse to connect to; this
+way AAAA is answered empty in ~0 ms. Two things that look like improvements
+here are not:
+
+* **`"blockTypes": [28]`** to suppress AAAA makes those queries *time out*
+  rather than answer empty — worse than doing nothing.
+* **`queryStrategy: "UseIP"`** costs 366–2656 ms per AAAA lookup for addresses
+  that get blackholed anyway.
+
+`nonIPQuery: "skip"` passes MX, TXT and the HTTPS/type-65 records browsers now
+request constantly straight through instead of dropping them.
+
+
+
 While the tunnel is up, `/etc/resolv.conf` is replaced with `1.1.1.1` /
-`8.8.8.8`. Those are public addresses, so the queries go into the TUN and out
+`8.8.8.8`. Those addresses are mostly symbolic — a routing rule captures port
+53 from the tunnel regardless of which resolver an application aims at, so the
+cache is used either way, and nothing escapes unproxied. Those are public addresses, so the queries go into the TUN and out
 through the server instead of to your LAN router — no leak. The original file
 is snapshotted in `/run/xray-tun/` and restored on stop.
 

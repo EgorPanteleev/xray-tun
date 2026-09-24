@@ -118,6 +118,38 @@ xray run -dump -confdir "$CT" >/dev/null 2>&1 \
     && ok "xray still starts with no profile" \
     || bad "xray still starts with no profile" "confdir broke"
 
+echo "dns caching:"
+# The shipped config must answer from cache, and must not make AAAA or
+# HTTPS/type-65 queries hang -- browsers ask for both on every domain, and a
+# resolver that swallows them is slower than having no resolver at all.
+# xray -dump strips the // comments and applies defaults, so this inspects
+# what xray really builds rather than what the file appears to say.
+dns_cfg=$WORK/dns-dump.json
+xray run -dump -c "$SRC/etc/config.json" > "$dns_cfg" 2>/dev/null
+if [ -s "$dns_cfg" ]; then
+    has_rule=$(python3 -c "
+import json,sys
+d=json.load(open('$dns_cfg'))
+print(any(r.get('outboundTag')=='dns-out' for r in d['routing']['rules']))")
+    is "dns hijack rule present" "$has_rule" "True"
+    has_out=$(python3 -c "
+import json
+d=json.load(open('$dns_cfg'))
+print(any(o.get('tag')=='dns-out' for o in d['outbounds']))")
+    is "dns outbound present" "$has_out" "True"
+    strat=$(python3 -c "
+import json
+print(json.load(open('$dns_cfg'))['dns'].get('queryStrategy'))")
+    is "queries IPv4 only (v6 is blackholed)" "$strat" "UseIPv4"
+    blocked=$(python3 -c "
+import json
+o=[x for x in json.load(open('$dns_cfg'))['outbounds'] if x.get('tag')=='dns-out'][0]
+print('blockTypes' in o.get('settings', {}))")
+    is "no blockTypes (it makes AAAA time out)" "$blocked" "False"
+else
+    bad "dns config dump" "xray could not dump etc/config.json"
+fi
+
 echo "bad names:"
 for n in '../evil' '/etc/passwd' 'a/b' '.hidden'; do
     if "$V" --install --name "$n" 'vless://4444@x.example.com:2443?type=tcp' >/dev/null 2>&1
