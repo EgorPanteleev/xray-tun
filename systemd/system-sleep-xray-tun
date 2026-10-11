@@ -1,0 +1,10 @@
+#!/bin/sh
+# Installed as /etc/systemd/system-sleep/xray-tun
+#
+# systemd blocks the tail of the resume until these scripts return, so this
+# does nothing except kick off an asynchronous unit. The waiting for a working
+# network happens there, not here.
+[ "$1" = "post" ] || exit 0
+systemctl is-active --quiet xray-tun.service || exit 0
+systemctl start --no-block xray-tun-resume.service || true
+exit 0

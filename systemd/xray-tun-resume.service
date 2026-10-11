@@ -1,0 +1,11 @@
+[Unit]
+Description=Re-establish the Xray tunnel after resume
+Documentation=man:systemd-sleep(8)
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+After=NetworkManager.service network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/xray-tun/netctl.sh resume
+# netctl.sh waits up to 30s for a real default route, then restarts the tunnel.
+TimeoutStartSec=120

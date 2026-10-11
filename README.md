@@ -348,9 +348,9 @@ cache is used either way, and nothing escapes unproxied. Those are public addres
 through the server instead of to your LAN router — no leak. The original file
 is snapshotted in `/run/xray-tun/` and restored on stop.
 
-NetworkManager will rewrite `resolv.conf` if you change network connection
-while the tunnel is up; `xray-tun restart` puts it back. Set `MANAGE_DNS=0`
-in `xray-tun.conf` if you'd rather handle DNS yourself.
+NetworkManager rewrites `resolv.conf` whenever a connection activates; a
+dispatcher hook puts ours back automatically (see **Sleep and resume**). Set
+`MANAGE_DNS=0` in `xray-tun.conf` if you'd rather handle DNS yourself.
 
 ### IPv6
 
@@ -376,6 +376,59 @@ rule priorities, IPv6 mode, DNS, bypass subnets.
 Run `xray-tun check` after editing; `ExecStartPre` also validates with
 `xray run -dump`, so a typo fails the unit instead of half-configuring your
 routing.
+
+## Sleep and resume
+
+Waking the machine used to leave it apparently offline. The cause is worth
+stating precisely, because "the VPN reconnects by itself" is nearly true and
+still not enough:
+
+for the first seconds after resume there is no route at all, so every dial the
+proxy makes fails with `ENETUNREACH` — while the routing rules keep sending all
+traffic into the TUN. The machine is not merely offline, it is **black-holed**.
+Meanwhile NetworkManager, bringing its connection back up, rewrites
+`/etc/resolv.conf` and quietly removes our resolver. From the journal of one
+such resume:
+
+```
+PM: suspend exit
+xray: failed to dial to <server> > dial tcp <server>: connect: network is unreachable
+   ... 31 more of those ...
+NetworkManager: device (wlan0): Activation: starting connection
+```
+
+Three pieces address it, all installed by `install.sh`:
+
+* **`/etc/systemd/system-sleep/xray-tun`** fires on resume. It does nothing
+  but start a unit asynchronously — systemd blocks the tail of the resume
+  until sleep hooks return, so this one must not wait for anything.
+* **`xray-tun-resume.service`** waits up to 30 s for a real default route,
+  then restarts the tunnel. That re-asserts the routes, the TUN address and
+  `resolv.conf` deterministically, instead of hoping the retry loop wins the
+  race against DHCP.
+* **`/etc/NetworkManager/dispatcher.d/90-xray-tun`** puts our resolver back
+  whenever a connection comes up or changes — which covers moving between
+  wifi and tethering, not just resume.
+
+It also refreshes the saved copy of the original `resolv.conf`. The first
+version snapshotted once, when the tunnel came up, so stopping the tunnel
+after a network change restored a resolver from a network no longer in reach —
+a gateway on a subnet you had left. Now the snapshot follows the network you
+are actually on.
+
+And **`/etc/NetworkManager/conf.d/99-xray-tun-unmanaged.conf`** keeps NM off
+the TUN device entirely. Left alone it adopts `xtun0` as an "external"
+connection and runs it through a full activation cycle, applying its own DNS
+and routing to a device whose addressing we manage ourselves:
+
+```
+NetworkManager: device (xtun0): state change: disconnected -> prepare
+NetworkManager: device (xtun0): state change: ip-config -> ip-check
+```
+
+If NM already sets `unmanaged-devices` elsewhere on your system, `install.sh`
+says so and leaves it alone rather than overwriting it — add
+`interface-name:xtun0` to your own rule.
 
 ## Notes and caveats
 

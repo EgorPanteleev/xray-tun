@@ -1,0 +1,25 @@
+#!/bin/sh
+# Installed as /etc/NetworkManager/dispatcher.d/90-xray-tun
+#
+# NetworkManager owns /etc/resolv.conf and rewrites it every time a connection
+# activates -- on resume, and on every move between wifi and tethering. That
+# silently points DNS back at the LAN resolver while the tunnel is still up.
+# This puts our resolver back, and refreshes the saved original so that
+# stopping the tunnel restores the DNS of the network we are on now.
+iface="$1"
+action="$2"
+
+TUN_NAME=xtun0
+[ -r /etc/xray-tun/xray-tun.conf ] && . /etc/xray-tun/xray-tun.conf
+
+[ "$iface" = "$TUN_NAME" ] && exit 0        # our own device: nothing to do
+
+case "$action" in
+    up|dhcp4-change|dhcp6-change|reapply|connectivity-change) ;;
+    *) exit 0 ;;
+esac
+
+systemctl is-active --quiet xray-tun.service || exit 0
+[ -x /usr/local/lib/xray-tun/netctl.sh ] || exit 0
+/usr/local/lib/xray-tun/netctl.sh redns || true
+exit 0

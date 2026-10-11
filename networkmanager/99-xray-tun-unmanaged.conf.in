@@ -1,0 +1,8 @@
+# Installed as /etc/NetworkManager/conf.d/99-xray-tun-unmanaged.conf
+#
+# Keep NetworkManager's hands off our TUN device. Left to itself it adopts
+# xtun0 as an "external" connection and runs it through a full activation
+# cycle -- which means it may apply its own DNS and routing to a device whose
+# addressing and routes we manage ourselves.
+[keyfile]
+unmanaged-devices=interface-name:@TUN_NAME@

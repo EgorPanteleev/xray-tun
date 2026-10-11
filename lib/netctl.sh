@@ -17,7 +17,10 @@
 
 set -uo pipefail
 
-CONF=/etc/xray-tun/xray-tun.conf
+# XRAY_TUN_CONF / XRAY_TUN_STATE / XRAY_TUN_RESOLV exist so the DNS handling
+# can be exercised by the test suite against throwaway files, instead of being
+# shipped unverified. Unset, they are the real thing.
+CONF=${XRAY_TUN_CONF:-/etc/xray-tun/xray-tun.conf}
 
 TUN_NAME=xtun0
 TUN_MTU=1500
@@ -37,8 +40,8 @@ BYPASS6="::1/128 fe80::/10 fc00::/7 ff00::/8"
 # shellcheck source=/dev/null
 [ -r "$CONF" ] && . "$CONF"
 
-STATE_DIR=/run/xray-tun
-RESOLV=/etc/resolv.conf
+STATE_DIR=${XRAY_TUN_STATE:-/run/xray-tun}
+RESOLV=${XRAY_TUN_RESOLV:-/etc/resolv.conf}
 RESOLV_BAK="$STATE_DIR/resolv.conf.bak"
 RESOLV_LINK="$STATE_DIR/resolv.conf.link"
 
@@ -130,24 +133,64 @@ up() {
 
 take_dns() {
     [ "$MANAGE_DNS" = 1 ] || return 0
+    snapshot_dns
+    write_dns
+}
+
+snapshot_dns() {
     mkdir -p "$STATE_DIR"
-    # Only snapshot once; a restart must not overwrite the real backup with
-    # our own generated file.
-    if [ ! -e "$RESOLV_BAK" ] && [ ! -e "$RESOLV_LINK" ]; then
-        if [ -L "$RESOLV" ]; then
-            readlink "$RESOLV" > "$RESOLV_LINK"
-        elif [ -e "$RESOLV" ]; then
-            cp -a "$RESOLV" "$RESOLV_BAK"
-        else
-            : > "$RESOLV_LINK"   # nothing was there
-        fi
+    # Only snapshot what someone else wrote. Snapshotting our own file would
+    # destroy the real original and leave nothing to restore.
+    if [ -e "$RESOLV_BAK" ] || [ -e "$RESOLV_LINK" ]; then
+        return 0
     fi
+    if [ -L "$RESOLV" ]; then
+        readlink "$RESOLV" > "$RESOLV_LINK"
+    elif [ -e "$RESOLV" ]; then
+        cp -a "$RESOLV" "$RESOLV_BAK"
+    else
+        : > "$RESOLV_LINK"   # nothing was there
+    fi
+}
+
+write_dns() {
     {
         echo "# Written by xray-tun. Original saved under $STATE_DIR."
         local ns
         for ns in $DNS_SERVERS; do echo "nameserver $ns"; done
         echo "options edns0"
     } > "$RESOLV".xray-tun.tmp && mv -f "$RESOLV".xray-tun.tmp "$RESOLV"
+}
+
+ours() {
+    head -1 "$RESOLV" 2>/dev/null | grep -q 'Written by xray-tun'
+}
+
+# Re-assert our resolver after something else rewrote /etc/resolv.conf.
+#
+# NetworkManager owns that file and rewrites it whenever a connection comes
+# up -- which is exactly what happens on resume, and on every switch between
+# wifi and tethering. Without this, the tunnel keeps running while DNS quietly
+# points back at the LAN resolver.
+#
+# It also refreshes the saved original, so `down` restores the DNS of the
+# network we are on NOW. The old behaviour snapshotted once and could put back
+# a resolver from a network that is no longer in reach.
+redns() {
+    [ "$MANAGE_DNS" = 1 ] || return 0
+    ip link show dev "$TUN_NAME" >/dev/null 2>&1 || return 0
+    if ! ours; then
+        mkdir -p "$STATE_DIR"
+        rm -f "$RESOLV_BAK" "$RESOLV_LINK"
+        if [ -L "$RESOLV" ]; then
+            readlink "$RESOLV" > "$RESOLV_LINK"
+        elif [ -e "$RESOLV" ]; then
+            cp -a "$RESOLV" "$RESOLV_BAK"
+        fi
+        log "adopted the current resolv.conf as the saved original"
+    fi
+    write_dns
+    log "re-asserted DNS ($DNS_SERVERS)"
 }
 
 restore_dns() {
@@ -182,8 +225,39 @@ down() {
     return 0
 }
 
+has_phys_default() {
+    # Our own default lives in table $RT_TABLE, never in main, so anything
+    # here is the real link.
+    ip route show table main default 2>/dev/null | grep -q default
+}
+
+# Rebuild the tunnel after the machine wakes up.
+#
+# xray does reconnect on its own, but that is not enough. For the first
+# seconds after resume there is no route at all and every dial fails with
+# ENETUNREACH, while the routing rules still send all traffic into the TUN --
+# so the machine is black-holed, not merely offline. Meanwhile NetworkManager
+# has rewritten resolv.conf for the connection it just brought up. Waiting for
+# a real default route and then restarting puts all of it back deterministically
+# instead of hoping the retry loop wins the race.
+resume() {
+    local i
+    for i in $(seq 1 60); do
+        has_phys_default && break
+        sleep 0.5
+    done
+    if ! has_phys_default; then
+        log "resume: no default route after 30s; restarting anyway"
+    fi
+    sleep 1                      # let DHCP and DNS settle
+    log "resume: restarting the tunnel"
+    systemctl restart xray-tun.service
+}
+
 case "${1:-}" in
-    up)   up ;;
-    down) down ;;
-    *)    echo "usage: $0 {up|down}" >&2; exit 2 ;;
+    up)     up ;;
+    down)   down ;;
+    redns)  redns ;;
+    resume) resume ;;
+    *)      echo "usage: $0 {up|down|redns|resume}" >&2; exit 2 ;;
 esac
