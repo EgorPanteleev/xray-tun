@@ -219,6 +219,11 @@ case "${1:-status}" in
     show)
         shift
         $SUDO "$V2X" --show "$@" ;;
+    ping)
+        shift
+        # sudo so the hop to the server can be measured too: that needs
+        # SO_MARK to leave the tunnel, and the profile is root-only.
+        if [ $# -ge 1 ]; then $SUDO "$V2X" --ping "$1"; else $SUDO "$V2X" --ping; fi ;;
     check)           $SUDO /usr/bin/xray run -dump -confdir "$CONF_DIR" >/dev/null \
                          && echo "${c_ok}config OK${c_r}" \
                          || { echo "${c_no}config INVALID${c_r}"; exit 1; } ;;
@@ -246,6 +251,7 @@ servers:
   xray-tun use [NAME]    switch; no name opens a picker
   xray-tun rm [NAME]     delete; no name opens a picker
   xray-tun show [NAME]   details of a server; --show-link prints its URL
+  xray-tun ping [NAME]   latency to the server, and through it
 
   in a picker: arrows or w/s move, enter selects, q cancels, 1-9 jump
 

@@ -24,6 +24,7 @@ binary rather than assumed:
   sudo vless2xray --use tokyo                            # switch
   sudo vless2xray --remove tokyo                         # delete
   sudo vless2xray --show tokyo                           # details
+  sudo vless2xray --ping tokyo                           # latency
 """
 
 import argparse
@@ -34,6 +35,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse as up
 
 # XRAY_TUN_CONFDIR points the whole tool at another config tree -- for tests,
@@ -176,6 +178,23 @@ def list_profiles():
     return sorted(names)
 
 
+def dropin_target_missing():
+    """Is the active symlink really dangling, or just unreadable to us?
+
+    os.path.exists() follows the link, and servers/ is 0700 root-only -- so an
+    unprivileged caller gets False for a perfectly healthy profile. Treating
+    that as dangling would have us "heal" a working config. Only a genuine
+    ENOENT counts; if we are not allowed to look, assume it is fine.
+    """
+    try:
+        os.stat(DROPIN_PATH)                      # follows the link
+        return False
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False                              # permission, or anything else
+
+
 def repair_store():
     """Fix up anything an older version, or a manual edit, left behind.
 
@@ -184,20 +203,32 @@ def repair_store():
       * delete a stale 50-server.json -- it sorts BEFORE config.json and so
         demotes the proxy outbound (the bug the zz- prefix exists to avoid);
       * adopt a regular-file zz-server.json from the pre-profiles layout;
-      * drop a dangling active symlink. xray refuses to start on one -- it
-        aborts reading the whole confdir -- so healing it is what keeps
+      * drop a genuinely dangling active symlink. xray refuses to start on one
+        -- it aborts reading the whole confdir -- so healing it is what keeps
         `xray-tun on` working after someone deletes a profile by hand.
+
+    Every repair is best-effort: read-only commands are allowed to run without
+    root, and must not die just because there was nothing they could fix.
     """
     for stale in LEGACY_DROPINS:
         sp = os.path.join(CONF_DIR, stale)
         if os.path.exists(sp):
-            os.remove(sp)
+            try:
+                os.remove(sp)
+            except OSError:
+                continue
             print(f"removed stale {sp} (it sorted before config.json)")
 
     if os.path.islink(DROPIN_PATH):
-        if not os.path.exists(DROPIN_PATH):        # follows the link
+        if dropin_target_missing():
             gone = active_name()
-            os.remove(DROPIN_PATH)
+            try:
+                os.remove(DROPIN_PATH)
+            except OSError:
+                warn(f"active profile {gone!r} is missing its file and I "
+                     "cannot clear the link; xray will not start "
+                     "(try: sudo xray-tun ls)")
+                return
             warn(f"active profile {gone!r} was missing its file; cleared it "
                  "(xray cannot start on a dangling link)")
         return
@@ -205,15 +236,18 @@ def repair_store():
     if not os.path.isfile(DROPIN_PATH):
         return
 
-    os.makedirs(SERVERS_DIR, mode=0o700, exist_ok=True)
-    meta = read_meta(DROPIN_PATH)
-    name = check_name(slugify(meta.get("name") or meta.get("remark")
-                              or "default", "default"))
-    while os.path.exists(profile_path(name)):
-        name += "-1"
-    shutil.move(DROPIN_PATH, profile_path(name))
-    os.chmod(profile_path(name), 0o600)
-    link_profile(name)
+    try:
+        os.makedirs(SERVERS_DIR, mode=0o700, exist_ok=True)
+        meta = read_meta(DROPIN_PATH)
+        name = check_name(slugify(meta.get("name") or meta.get("remark")
+                                  or "default", "default"))
+        while os.path.exists(profile_path(name)):
+            name += "-1"
+        shutil.move(DROPIN_PATH, profile_path(name))
+        os.chmod(profile_path(name), 0o600)
+        link_profile(name)
+    except OSError:
+        return                                    # not ours to fix right now
     print(f"adopted the existing server as profile {name!r}")
 
 
@@ -475,6 +509,154 @@ def render(outbound, remark, link, name, tag):
                                                 indent=2) + "\n"
 
 
+# ----------------------------------------------------------------------- ping
+#
+# Two different numbers, because they fail differently:
+#
+#   "to server"  -- one TCP handshake straight to the server's host:port, sent
+#                   out the physical interface. Pure network distance to the
+#                   endpoint, and it works even when the tunnel is down.
+#   "through it" -- a real HTTP round trip carried by the proxy. This is the
+#                   latency you actually feel opening a page.
+#
+# A small "to server" with a huge "through it" means the server is reachable
+# but struggling; both large means the server is simply far away.
+#
+# Note on method: xray answers a SOCKS5 CONNECT *optimistically*, before the
+# upstream connection exists -- a blackholed destination still gets a success
+# reply in under a millisecond. So timing the handshake measures nothing. Only
+# a full request/response through the tunnel is a real measurement.
+
+SOCKS_PORT = 10808
+PING_TARGET = "1.1.1.1:80"
+PING_ROUNDS = 3
+
+
+def _ping_settings():
+    target, rounds = PING_TARGET, PING_ROUNDS
+    try:
+        with open(NETCONF) as fh:
+            conf = fh.read()
+        m = re.search(r'^\s*PING_TARGET=\"?([^\s\"#]+)', conf, re.M)
+        if m:
+            target = m.group(1)
+        m = re.search(r"^\s*PING_ROUNDS=(\d+)", conf, re.M)
+        if m:
+            rounds = max(1, min(10, int(m.group(1))))
+    except OSError:
+        pass
+    host, _, port = target.partition(":")
+    return host, int(port or 80), rounds
+
+
+def _rtt_to_server(host, port, mark, timeout=4.0):
+    """One TCP handshake to the server, forced out the real interface.
+
+    Without the fwmark this would be routed *into* the tunnel we are trying to
+    measure, and time the long way round to our own exit node.
+    """
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    if not infos:
+        return None
+    family, _, _, _, sa = infos[0]
+    sock = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if mark:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET,
+                                getattr(socket, "SO_MARK", 36), mark)
+            except OSError:
+                return None            # not root: cannot escape our own tunnel
+        sock.settimeout(timeout)
+        t0 = time.monotonic()
+        sock.connect(sa)
+        return (time.monotonic() - t0) * 1000
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def _rtt_through_proxy(target_host, target_port, timeout=6.0):
+    """Time a real HTTP round trip carried by the daemon's SOCKS inbound."""
+    import socket
+    import struct
+    try:
+        sock = socket.create_connection(("127.0.0.1", SOCKS_PORT), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        sock.settimeout(timeout)
+        t0 = time.monotonic()
+        sock.sendall(b"\x05\x01\x00")
+        if sock.recv(2) != b"\x05\x00":
+            return None
+        try:
+            addr = socket.inet_aton(target_host)
+            req = b"\x05\x01\x00\x01" + addr + struct.pack(">H", target_port)
+        except OSError:                                  # a hostname, not an IP
+            host = target_host.encode()
+            req = (b"\x05\x01\x00\x03" + bytes([len(host)]) + host
+                   + struct.pack(">H", target_port))
+        sock.sendall(req)
+        reply = sock.recv(10)
+        if len(reply) < 2 or reply[1] != 0:
+            return None
+        sock.sendall(b"HEAD / HTTP/1.1\r\nHost: " + target_host.encode()
+                     + b"\r\nConnection: close\r\nUser-Agent: xray-tun\r\n\r\n")
+        if not sock.recv(1):                             # upstream never answered
+            return None
+        return (time.monotonic() - t0) * 1000
+    except OSError:
+        return None
+    finally:
+        sock.close()
+
+
+def measure_ping(server=None, mark=None):
+    """Both numbers, each None when it could not be taken."""
+    host, port, rounds = _ping_settings()
+    if mark is None:
+        mark = default_mark()
+
+    direct = []
+    if server:
+        shost, _, sport = server.rpartition(":")
+        if shost and sport.isdigit():
+            for _ in range(rounds):
+                ms = _rtt_to_server(shost, int(sport), mark)
+                if ms is not None:
+                    direct.append(ms)
+
+    via = []
+    for _ in range(rounds):
+        ms = _rtt_through_proxy(host, port)
+        if ms is not None:
+            via.append(ms)
+
+    return (min(direct) if direct else None), (min(via) if via else None)
+
+
+def report_ping(server=None, prefix="ping      "):
+    """Print the pair as one line. Silent when there is nothing to say."""
+    if os.environ.get("XRAY_TUN_NO_PING") == "1":
+        return
+    direct, via = measure_ping(server)
+    parts = []
+    if direct is not None:
+        parts.append(f"{direct:.0f} ms to server")
+    if via is not None:
+        parts.append(f"{via:.0f} ms through it")
+    if not parts:
+        print(f"{prefix}{C['dim']}could not measure{C['r']}")
+        return
+    print(prefix + f" {C['dim']}\u00b7{C['r']} ".join(parts))
+
+
 # ------------------------------------------------------------------- terminal
 #
 # Everything here talks to /dev/tty directly rather than stdin/stdout, for two
@@ -725,7 +907,7 @@ def describe(outbound):
     return lines
 
 
-def cmd_add(link, name, tag, mark, restart, force=False):
+def cmd_add(link, name, tag, mark, restart, force=False, ping=True):
     need_root("--install")
     require_confdir()
     repair_store()
@@ -791,12 +973,14 @@ def cmd_add(link, name, tag, mark, restart, force=False):
           + (f"  ({remark})" if remark else ""))
 
     was = active_name()
-    if was != name:
+    switched = was != name
+    if switched:
         link_profile(name)
         print(f"active profile is now {name!r}" + (f" (was {was!r})" if was else ""))
-        restart = restart and True
     if restart:
         restart_if_running()
+    if SYSTEM and ping and switched:
+        report_ping(read_meta(dest)["server"])
     return name
 
 
@@ -818,7 +1002,7 @@ def cmd_list():
         warn("no active server; config.json's placeholder is in use")
 
 
-def cmd_use(name, restart):
+def cmd_use(name, restart, ping=True):
     need_root("--use")
     require_confdir()
     repair_store()
@@ -843,6 +1027,8 @@ def cmd_use(name, restart):
     print(f"active profile is now {name!r}")
     if restart:
         restart_if_running()
+    if SYSTEM and ping:
+        report_ping(read_meta(profile_path(name))["server"])
 
 
 def cmd_remove(name, force, restart):
@@ -906,6 +1092,31 @@ def cmd_remove(name, force, restart):
             restart_if_running(quiet=True)
 
 
+def cmd_ping(name):
+    """Measure the active server, or a named one."""
+    require_confdir()
+    repair_store()
+    act = active_name()
+    name = name or act
+    if not name:
+        die("no active server to measure (xray-tun ls)")
+    check_name(name)
+
+    meta = read_meta(profile_path(name))
+    readable = not meta["server"].startswith(("?", "unreadable"))
+    if readable:
+        print(f"{name}  {C['dim']}{meta['server']}  "
+              f"{meta['transport']}/{meta['security']}{C['r']}")
+    else:
+        print(name)
+        warn("cannot read the profile (it is root-only), so the hop to the "
+             "server cannot be measured -- try: sudo xray-tun ping")
+    if name != act:
+        warn(f"{name!r} is not the active server; the latency through the "
+             "tunnel belongs to " + (repr(act) if act else "no server"))
+    report_ping(meta["server"] if readable else None)
+
+
 def cmd_show(name, want_link):
     require_confdir()
     repair_store()
@@ -965,6 +1176,11 @@ def main():
                             "with --install, accept a link that looks truncated")
     store.add_argument("--show", metavar="NAME", nargs="?", const="",
                        help="show a profile's details (default: the active one)")
+    store.add_argument("--ping", metavar="NAME", nargs="?", const="",
+                       help="measure latency to a server and through it "
+                            "(default: the active one)")
+    store.add_argument("--no-ping", action="store_true",
+                       help="skip the latency check after switching")
     store.add_argument("--show-link", action="store_true",
                        help="with --show, print the stored vless:// link instead")
     store.add_argument("--no-restart", action="store_true",
@@ -989,7 +1205,8 @@ def main():
     picked = [n for n, v in (("--list", args.list),
                              ("--use", args.use is not None),
                              ("--remove", args.remove is not None),
-                             ("--show", args.show is not None)) if v]
+                             ("--show", args.show is not None),
+                             ("--ping", args.ping is not None)) if v]
     if len(picked) > 1:
         die(f"pick one of {', '.join(picked)}, not several")
     if picked and args.install:
@@ -998,18 +1215,20 @@ def main():
     if args.list:
         return cmd_list()
     if args.use is not None:
-        return cmd_use(args.use, restart)
+        return cmd_use(args.use, restart, ping=not args.no_ping)
     if args.remove is not None:
         return cmd_remove(args.remove, args.force, restart)
     if args.show is not None:
         return cmd_show(args.show or None, args.show_link)
+    if args.ping is not None:
+        return cmd_ping(args.ping or None)
 
     # --- conversion (and optionally adding a profile) ---
     if args.link is None:
         if args.install:
             # Interactive add: cmd_add prompts for the link itself.
             return cmd_add("", args.name, args.tag, mark_for(args), restart,
-                           args.force)
+                           args.force, ping=not args.no_ping)
         if sys.stdin.isatty():
             ap.error("no link given (pass a vless:// URL, - for stdin, "
                      "or a profile action such as --list)")
@@ -1025,7 +1244,8 @@ def main():
     mark = mark_for(args)
 
     if args.install:
-        return cmd_add(link, args.name, args.tag, mark, restart, args.force)
+        return cmd_add(link, args.name, args.tag, mark, restart, args.force,
+                       ping=not args.no_ping)
 
     bad = looks_truncated(link)
     if bad:

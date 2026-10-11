@@ -63,7 +63,36 @@ xray-tun ls             # list them
 xray-tun use [NAME]     # switch; no name opens a picker
 xray-tun rm [NAME]      # delete; no name opens a picker
 xray-tun show [NAME]    # details; --show-link prints the original URL
+xray-tun ping [NAME]    # latency to the server, and through it
 ```
+
+Switching reports latency straight away, so you can tell immediately whether
+the server you picked is any good:
+
+```console
+$ xray-tun use berlin
+active profile is now 'berlin'
+restarted xray-tun.service
+ping      41 ms to server · 223 ms through it
+```
+
+Two numbers, because they fail differently. **to server** is a single TCP
+handshake to the server's own `host:port` — pure network distance, and it still
+works when the tunnel is down. **through it** is a real HTTP round trip carried
+by the proxy — the latency you actually feel opening a page. A small first
+number with a large second one means the server is reachable but struggling;
+both large means it is simply far away.
+
+The hop to the server has to leave via the physical interface, which needs
+`SO_MARK` — so without `sudo` only the second number is available. `xray-tun`
+runs it under `sudo` for you. `XRAY_TUN_NO_PING=1` skips the check, and
+`PING_TARGET` / `PING_ROUNDS` in `xray-tun.conf` tune it.
+
+Measuring it correctly is less obvious than it looks: xray answers a SOCKS5
+`CONNECT` **optimistically**, before the upstream connection exists — a
+blackholed destination still gets a success reply in under a millisecond. Timing
+the handshake therefore measures nothing at all, which is why this does a full
+request/response instead.
 
 `use` and `rm` with no name open an arrow-key menu:
 

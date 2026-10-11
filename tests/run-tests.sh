@@ -181,6 +181,47 @@ then ok "--force overrides the guard"; else bad "--force overrides the guard" "s
 if bin/xray-tun add trunc 'vless://u@h.example.com:8443?path=%2Fws' >/dev/null 2>&1
 then bad "wrapper catches it pre-sudo" "accepted"; else ok "wrapper catches it pre-sudo"; fi
 
+echo "latency check:"
+# The ping must never fire in a non-system config dir: tests are offline, and
+# a switch should not block on the network just because someone pointed
+# XRAY_TUN_CONFDIR at a scratch tree.
+# Match on the measurement itself ("... ms to server" / "... ms through it"),
+# never on the word "ping" -- a profile name can contain that.
+measured() { case "$1" in *" ms to server"*|*" ms through it"*|*"could not measure"*) return 0 ;; esac; return 1; }
+
+for n in lat-a lat-b; do
+    XRAY_TUN_CONFDIR=$CT "$V" --install --name "$n" \
+        "vless://1111@$n.example.com:8443?type=ws&security=tls&sni=$n.example.com&path=%2Fw#$n" \
+        >/dev/null 2>&1
+done
+out=$(XRAY_TUN_CONFDIR=$CT timeout 15 "$V" --use lat-a 2>&1)
+case "$out" in *"active profile is now"*) : ;; *) bad "switch happened" "$out" ;; esac
+if measured "$out"; then
+    bad "no latency check outside the system confdir" "measured anyway: $out"
+else
+    ok "no latency check outside the system confdir"
+fi
+out=$(XRAY_TUN_CONFDIR=$CT XRAY_TUN_NO_PING=1 timeout 15 "$V" --ping lat-a 2>&1)
+if measured "$out"; then
+    bad "XRAY_TUN_NO_PING silences it" "still printed: $out"
+else
+    ok "XRAY_TUN_NO_PING silences it"
+fi
+# A healthy-but-unreadable profile must not be mistaken for a dangling link:
+# servers/ is 0700, so exists() lies to an unprivileged caller.
+CT=$CT probe=$(CT=$CT python3 - <<'PY2'
+import os, sys
+sys.argv = ["x"]
+src = open("bin/vless2xray").read().replace('if __name__ == "__main__":', 'if False:')
+m = type(sys)("m"); m.__dict__["__name__"] = "m"
+os.environ["XRAY_TUN_CONFDIR"] = os.environ["CT"]
+exec(compile(src, "v", "exec"), m.__dict__)
+link = os.path.join(os.environ["CT"], "zz-server.json")
+print("missing" if m.dropin_target_missing() else "present")
+PY2
+)
+CT=$CT is "a readable profile is not 'dangling'" "$probe" "present"
+
 echo "self-repair:"
 "$V" --install --name gamma 'vless://5555@gamma.example.com:2443?type=tcp&security=none' >/dev/null
 rm -f "$CT/servers/gamma.json"                     # dangling symlink
